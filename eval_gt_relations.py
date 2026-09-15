@@ -67,6 +67,8 @@ from relation_prediction.vg_dataset import (
     _xywh_to_xyxy,
 )
 from relation_prediction.predict import _infer_hidden_dims, _infer_clip_dim
+from relation_prediction.model import format_feature_blocks
+from utils.console import configure_safe_stdio
 
 
 # ---------------------------------------------------------------------------
@@ -270,6 +272,20 @@ def assert_disjoint(train_ids, val_ids, test_ids) -> Dict:
     }
 
 
+def format_overlap_line(overlap: Dict) -> str:
+    """The overlap-check status line, ASCII only.
+
+    It used to print U+2229 (the intersection sign). Windows encodes redirected
+    stdout with the ANSI code page, cp1252, which has no such character, so
+    every evaluation launched by run_visual_experiment.py died on this line
+    with UnicodeEncodeError - after the checkpoint, the relationships and the
+    split had all loaded.
+    """
+    return (f"      overlap check: {overlap['status']} "
+            f"(train&val={overlap['train_n_val']}, train&test={overlap['train_n_test']}, "
+            f"val&test={overlap['val_n_test']})")
+
+
 # ---------------------------------------------------------------------------
 # Checkpoint loading (bare state_dict, geometry-only)
 # ---------------------------------------------------------------------------
@@ -398,6 +414,16 @@ def load_checkpoint(checkpoint_dir: str, device: torch.device,
         geo_dim=geo_dim,
         geo_norm=geo_norm,
     )
+    # Checkpoints written since the union-dimension fix record input_dim. When
+    # present it must agree with the model rebuilt from the other fields;
+    # otherwise the config describes a different model than the one scored.
+    saved_input_dim = config.get("input_dim") if wrapper != "bare_state_dict" else None
+    if saved_input_dim is not None and int(saved_input_dim) != model.input_dim:
+        raise SystemExit(
+            f"[E0] FATAL: checkpoint model_config records input_dim={saved_input_dim}, "
+            f"but the model rebuilt from it has input_dim={model.input_dim} "
+            f"[{format_feature_blocks(model.feature_blocks())}]. Refusing to evaluate."
+        )
     model.load_state_dict(state)
     model.to(device)
     model.eval()
@@ -420,7 +446,7 @@ def load_checkpoint(checkpoint_dir: str, device: torch.device,
             "geo_norm": geo_norm,
             "geo_mode": (config.get("geo_mode") if wrapper != "bare_state_dict" else None)
                         or _geo_mode_for_dim(geo_dim),
-            "input_dim": 2 * embed_dim + geo_dim + 2 * clip_dim + union_dim + pose_dim,
+            "input_dim": model.input_dim,
             "feature_mode": "geometry-only" if clip_dim == 0 else "+".join(
                 ["geometry", "clip"]
                 + (["union"] if union_dim else [])
@@ -512,6 +538,25 @@ def build_visual_test_set(vg_root, vg_image_dir, clip_cache_path, cfg,
         "n_dataset_total": len(ds),
     }
     return out
+
+
+def _feature_kwargs(vis, start, end, device):
+    """Visual-feature kwargs for test rows [start, end).
+
+    Shared by the inference loop and its preflight so the two cannot build
+    different batches. Returns {} for a checkpoint scored without visual data.
+    """
+    if vis is None:
+        return {}
+    kwargs = {
+        "subj_feat": vis["subj_feat"][start:end].to(device),
+        "obj_feat": vis["obj_feat"][start:end].to(device),
+    }
+    if vis["union_feat"] is not None:
+        kwargs["union_feat"] = vis["union_feat"][start:end].to(device)
+    if vis["pose_feat"] is not None:
+        kwargs["pose_feat"] = vis["pose_feat"][start:end].to(device)
+    return kwargs
 
 
 # ---------------------------------------------------------------------------
@@ -662,7 +707,7 @@ def main() -> None:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     print("=" * 70)
-    print("  E0 — IMAGE-DISJOINT GROUND-TRUTH VG RELATION EVALUATION")
+    print("  E0 - IMAGE-DISJOINT GROUND-TRUTH VG RELATION EVALUATION")
     print("=" * 70)
     print(f"  device        : {device}")
     print(f"  vg root       : {args.vg_root}")
@@ -671,7 +716,7 @@ def main() -> None:
     print()
 
     # --- 1. checkpoint --------------------------------------------------
-    print("[1/6] Loading checkpoint …")
+    print("[1/6] Loading checkpoint ...")
     model, label_vocab, pred_vocab, ckpt_info = load_checkpoint(
         args.checkpoint_dir, device, args.checkpoint_file,
     )
@@ -689,7 +734,7 @@ def main() -> None:
     print(f"      features    : {cfg['feature_mode']} "
           f"(clip={cfg['clip_dim']}, union={cfg['union_dim']}, pose={cfg['pose_dim']})")
     print(f"      parameters  : {ckpt_info['parameter_count']:,}")
-    print(f"      sha256      : {ckpt_info['sha256'][:16]}…")
+    print(f"      sha256      : {ckpt_info['sha256'][:16]}...")
 
     valid_idxs = [
         i for i in range(len(pred_vocab))
@@ -698,7 +743,7 @@ def main() -> None:
     print(f"      scored classes: {len(valid_idxs)} (PAD/UNK excluded)")
 
     # --- 2. samples -----------------------------------------------------
-    print("\n[2/6] Streaming relationships.json and applying repo filters …")
+    print("\n[2/6] Streaming relationships.json and applying repo filters ...")
     # The evaluation MUST reconstruct samples with the same predicate
     # normaliser the checkpoint was trained with, or the test population
     # silently differs from the training population.
@@ -718,7 +763,7 @@ def main() -> None:
     print(f"      qualifying images : {data_stats['qualifying_image_count']:,}")
 
     # --- 3. image-disjoint split ---------------------------------------
-    print("\n[3/6] Building image-disjoint split …")
+    print("\n[3/6] Building image-disjoint split ...")
     manifest_path = args.split_manifest
     reuse = os.path.isfile(manifest_path) and not args.rebuild_split
     if reuse:
@@ -735,9 +780,7 @@ def main() -> None:
         manifest = None
 
     overlap = assert_disjoint(train_ids, val_ids, test_ids)
-    print(f"      overlap check: {overlap['status']} "
-          f"(train∩val={overlap['train_n_val']}, train∩test={overlap['train_n_test']}, "
-          f"val∩test={overlap['val_n_test']})")
+    print(format_overlap_line(overlap))
 
     split_of: Dict[int, str] = {}
     for i in train_ids:
@@ -800,7 +843,7 @@ def main() -> None:
         print(f"      manifest written: {manifest_path}")
 
     # --- 4. inference on the TEST split ---------------------------------
-    print("\n[4/6] Running inference on the TEST split (raw logits only) …")
+    print("\n[4/6] Running inference on the TEST split (raw logits only) ...")
     # A checkpoint trained with --visual-filter-only has clip_dim=0 but was
     # fitted on the visual-complete subset, so it must be SCORED on that subset
     # too. Deciding from clip_dim alone would silently score the ablation's
@@ -812,7 +855,7 @@ def main() -> None:
     if needs_visual:
         # E1 path: CLIP / union / pose features, ground-truth boxes only.
         print(f"      checkpoint needs visual features ({cfg['feature_mode']}); "
-              "building visual test set …")
+              "building visual test set ...")
         vis = build_visual_test_set(
             args.vg_root,
             args.vg_image_dir or os.path.join(args.vg_root, "images"),
@@ -866,18 +909,22 @@ def main() -> None:
     valid_t = torch.tensor(valid_idxs, dtype=torch.long, device=device)
     kmax = max(TOPK)
 
+    # Preflight: the test batch's feature blocks must match the checkpoint
+    # before any logits are computed, so a mismatch is reported by block name
+    # (FeatureDimensionError) rather than as a matmul shape error.
+    if hasattr(model, "check_inputs") and n_test:
+        first = min(args.batch_size, n_test)
+        actual = model.check_inputs(geo_t[:first].to(device),
+                                    **_feature_kwargs(vis, 0, first, device))
+        print(f"      feature blocks: {format_feature_blocks(actual)}")
+        print(f"      input dim     : batch {sum(w for _, w in actual)} == "
+              f"model {model.input_dim}")
+
     top_idxs: List[List[int]] = []
     with torch.no_grad():
         for start in range(0, n_test, args.batch_size):
             end = min(start + args.batch_size, n_test)
-            kwargs = {}
-            if vis is not None:
-                kwargs["subj_feat"] = vis["subj_feat"][start:end].to(device)
-                kwargs["obj_feat"] = vis["obj_feat"][start:end].to(device)
-                if vis["union_feat"] is not None:
-                    kwargs["union_feat"] = vis["union_feat"][start:end].to(device)
-                if vis["pose_feat"] is not None:
-                    kwargs["pose_feat"] = vis["pose_feat"][start:end].to(device)
+            kwargs = _feature_kwargs(vis, start, end, device)
             logits = model(
                 subj_t[start:end].to(device),
                 obj_t[start:end].to(device),
@@ -894,7 +941,7 @@ def main() -> None:
                 print(f"      [{end:,}/{n_test:,}]")
 
     # --- 5. metrics ------------------------------------------------------
-    print("\n[5/6] Computing metrics …")
+    print("\n[5/6] Computing metrics ...")
     metrics, per_predicate, confusion = compute_metrics(
         gt_idxs, top_idxs, pred_vocab, valid_idxs,
     )
@@ -919,7 +966,7 @@ def main() -> None:
               f"{', '.join(metrics['zero_support_predicates'])}")
 
     # --- 6. write result --------------------------------------------------
-    print("\n[6/6] Writing result JSON …")
+    print("\n[6/6] Writing result JSON ...")
     elapsed = time.time() - t_start
     if args.output_name:
         ckpt_name = args.output_name
@@ -940,7 +987,7 @@ def main() -> None:
         if prev_sha and prev_sha != ckpt_info["sha256"]:
             raise SystemExit(
                 f"[E0] Refusing to overwrite {out_path}: it belongs to a "
-                f"different checkpoint (sha256 {prev_sha[:16]}…). "
+                f"different checkpoint (sha256 {prev_sha[:16]}...). "
                 "Use --output-name or --force."
             )
 
@@ -983,4 +1030,5 @@ def main() -> None:
 
 
 if __name__ == "__main__":
+    configure_safe_stdio()
     main()

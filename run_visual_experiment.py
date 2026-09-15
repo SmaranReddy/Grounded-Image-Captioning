@@ -44,6 +44,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import platform
 import statistics
 import subprocess
@@ -243,6 +244,18 @@ def preflight(vg_root: Path, manifest: Path, clip_cache: Path,
 # one run
 # ---------------------------------------------------------------------------
 
+def child_env() -> Dict[str, str]:
+    """Environment for the train / eval subprocesses.
+
+    Their stdout is redirected to train.log / eval.log, and on Windows a
+    redirected stream is encoded with the ANSI code page (cp1252), which cannot
+    represent every character the scripts print. UTF-8 keeps the logs lossless;
+    the scripts additionally never raise on an unencodable character
+    (utils/console.py), so this is belt and braces, not the fix itself.
+    """
+    return {**os.environ, "PYTHONIOENCODING": "utf-8"}
+
+
 def build_commands(variant: str, seed: int, vg_root: Path, manifest: Path,
                    clip_cache: Path, ckpt_dir: Path, results_dir: Path,
                    epochs: int, batch_size: int):
@@ -321,7 +334,8 @@ def run_one(variant: str, seed: int, args, pre: Optional[Dict]) -> Dict:
     train_log = run_dir / "train.log"
     with open(train_log, "w", encoding="utf-8") as fh:
         rc = subprocess.run(train_cmd, cwd=PROJ_ROOT, stdout=fh,
-                            stderr=subprocess.STDOUT, text=True).returncode
+                            stderr=subprocess.STDOUT, text=True,
+                            env=child_env()).returncode
     record["train_seconds"] = round(time.time() - t0, 1)
     record["train_returncode"] = rc
     print(f"  training finished rc={rc} in {record['train_seconds']}s "
@@ -336,7 +350,8 @@ def run_one(variant: str, seed: int, args, pre: Optional[Dict]) -> Dict:
     eval_log = run_dir / "eval.log"
     with open(eval_log, "w", encoding="utf-8") as fh:
         rc = subprocess.run(eval_cmd, cwd=PROJ_ROOT, stdout=fh,
-                            stderr=subprocess.STDOUT, text=True).returncode
+                            stderr=subprocess.STDOUT, text=True,
+                            env=child_env()).returncode
     record["eval_seconds"] = round(time.time() - t1, 1)
     record["eval_returncode"] = rc
 
@@ -484,4 +499,6 @@ def main() -> int:
 
 
 if __name__ == "__main__":
+    from utils.console import configure_safe_stdio
+    configure_safe_stdio()
     raise SystemExit(main())

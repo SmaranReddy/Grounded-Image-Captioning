@@ -89,7 +89,7 @@ four variants use them.
 python -m pytest tests/ -q
 ```
 
-Expected: **178 passed, 1 skipped** (the skip is `test_pope.py`, which needs
+Expected: **240 passed, 1 skipped** (the skip is `test_pope.py`, which needs
 `nltk` — not used by this experiment).
 
 ## 5. Verify the baseline — THIS IS A GATE

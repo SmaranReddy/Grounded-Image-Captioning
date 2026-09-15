@@ -40,12 +40,15 @@ import numpy as np
 PROJ_ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(PROJ_ROOT))
 
-from relation_prediction.model import RelationMLP
+from relation_prediction.model import (
+    FeatureDimensionError, RelationMLP, format_feature_blocks,
+)
 from relation_prediction.relation_transformer import RelationTransformer
 from relation_prediction.vg_dataset import (
     VGRelationshipDataset, Vocab, GEO_DIM, GEO_DIM_EXT,
     POSE_FEATURE_DIM, UNION_FEATURE_DIM, geo_extractor,
 )
+from utils.console import configure_safe_stdio
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -148,6 +151,119 @@ def _collate(batch):
     return result
 
 
+def resolve_feature_dims(*, use_visual, visual_filter_only, use_union, use_pose,
+                         geo_mode):
+    """Width of every optional feature block for a run's feature flags.
+
+    VISUAL_FILTER_ONLY is what makes the four-way feature ablation a valid
+    comparison. Turning visual features on changes the sample population
+    (require_visual drops pairs whose crops are missing or degenerate), so a
+    geometry run with use_visual=False would be scored on a DIFFERENT and
+    larger test set than the CLIP runs - the variants would differ in two
+    ways at once. With this flag the control loads the same cache and keeps
+    the same samples, and only the model's input width changes.
+    """
+    _, geo_dim = geo_extractor(geo_mode)
+    return {
+        "geo_dim": geo_dim,
+        "clip_dim": 0 if visual_filter_only else (
+            VGRelationshipDataset.CLIP_DIM if use_visual else 0),
+        "union_dim": UNION_FEATURE_DIM if use_union else 0,
+        "pose_dim": POSE_FEATURE_DIM if use_pose else 0,
+    }
+
+
+def _unpack_batch(batch, device, *, has_visual, use_union, use_pose):
+    """Split a collated batch into model inputs. The ONLY copy of the layout.
+
+    The training loop, per-epoch validation and the post-training best-model
+    analysis each used to carry their own unpacking, and the post-training
+    call omitted use_union: union_feat came back None, the model silently
+    skipped that block, and the union arm crashed with "mat1 and mat2 shapes
+    cannot be multiplied (512x1683 and 2451x256)" only after its last epoch.
+    The flags are keyword-only with no defaults so a caller cannot leave one
+    out, and the tensor count is checked so the layout cannot be misread.
+    """
+    n_expected = 4 + (2 if has_visual else 0) + int(use_union) + int(use_pose)
+    if len(batch) != n_expected:
+        raise FeatureDimensionError(
+            f"collated batch carries {len(batch)} tensors, but has_visual="
+            f"{has_visual}, use_union={use_union}, use_pose={use_pose} "
+            f"means {n_expected}"
+        )
+    subj, obj, geo, pred = (t.to(device) for t in batch[:4])
+    subj_feat = obj_feat = union_feat = pose_feat = None
+    idx = 4
+    if has_visual:
+        subj_feat = batch[idx].to(device)
+        obj_feat = batch[idx + 1].to(device)
+        idx += 2
+    if use_union:
+        union_feat = batch[idx].to(device)
+        idx += 1
+    if use_pose:
+        pose_feat = batch[idx].to(device)
+    return subj, obj, geo, pred, subj_feat, obj_feat, union_feat, pose_feat
+
+
+PREFLIGHT_SAMPLES = 8
+
+
+def preflight_feature_dims(model, splits, device, *, has_visual, use_union,
+                           use_pose):
+    """Fail before epoch 1 if any split's batches do not fit the model.
+
+    Each split gets a small batch built through the same _collate and
+    _unpack_batch that the loaders and the post-training analysis use. Every
+    feature block's width is checked against model.feature_blocks(), and one
+    no-grad forward is run in eval mode.
+
+    Samples are fetched by index rather than by iterating a DataLoader, so no
+    RNG is consumed: the shuffle order and every seeded draw after this are
+    exactly what they would have been without the check.
+    """
+    print(f"\n{'=' * 78}")
+    print("  PREFLIGHT - FEATURE DIMENSIONS")
+    print(f"{'=' * 78}")
+    expected = model.feature_blocks() if hasattr(model, "feature_blocks") else None
+    if expected is not None:
+        print(f"  model expects : {format_feature_blocks(expected)} = {model.input_dim}")
+    was_training = model.training
+    model.eval()
+    try:
+        for name, ds in splits.items():
+            try:
+                n = min(len(ds), PREFLIGHT_SAMPLES)
+                if n == 0:
+                    raise FeatureDimensionError(f"the {name} split is empty")
+                batch = _collate([ds[i] for i in range(n)])
+                subj, obj, geo, _, sf, of, uf, pf = _unpack_batch(
+                    batch, device, has_visual=has_visual,
+                    use_union=use_union, use_pose=use_pose)
+                if expected is not None:
+                    actual = model.check_inputs(geo, sf, of, uf, pf)
+                    actual_dim = sum(w for _, w in actual)
+                    if actual_dim != model.input_dim:
+                        raise FeatureDimensionError(
+                            f"{name} batch supplies {actual_dim} columns, "
+                            f"model expects {model.input_dim}")
+                    print(f"  {name:<5} batch   : {format_feature_blocks(actual)} "
+                          f"= {actual_dim}  OK")
+                with torch.no_grad():
+                    logits = model(subj, obj, geo, subj_feat=sf, obj_feat=of,
+                                   union_feat=uf, pose_feat=pf)
+                if logits.shape[0] != n:
+                    raise FeatureDimensionError(
+                        f"{name} forward returned {tuple(logits.shape)} for {n} samples")
+            except FeatureDimensionError:
+                print(f"\n  PREFLIGHT FAILED on the {name} split; training was "
+                      "not started.", file=sys.stderr)
+                raise
+    finally:
+        model.train(was_training)
+    print("  PREFLIGHT PASSED: every split's batch matches the model input width")
+
+
 _VALID_IDX_CACHE = {}
 
 
@@ -184,8 +300,8 @@ def macro_f1_from_metrics(metrics, preds, targets, pred_vocab):
     return sum(f1s) / len(f1s) if f1s else 0.0
 
 
-def compute_predicate_metrics(model, loader, device, pred_vocab, has_visual,
-                              use_union=False, use_pose=False):
+def compute_predicate_metrics(model, loader, device, pred_vocab, *, has_visual,
+                              use_union, use_pose):
     model.eval()
     per_pred_correct = defaultdict(int)
     per_pred_total = defaultdict(int)
@@ -196,18 +312,9 @@ def compute_predicate_metrics(model, loader, device, pred_vocab, has_visual,
 
     with torch.no_grad():
         for batch in loader:
-            subj = batch[0].to(device)
-            obj = batch[1].to(device)
-            geo = batch[2].to(device)
-            target = batch[3].to(device)
-
-            idx = 4
-            subj_feat = batch[idx].to(device) if has_visual else None
-            obj_feat = batch[idx + 1].to(device) if has_visual else None
-            idx += 2 if has_visual else 0
-            union_feat = batch[idx].to(device) if use_union else None
-            idx += 1 if use_union else 0
-            pose_feat = batch[idx].to(device) if use_pose else None
+            subj, obj, geo, target, subj_feat, obj_feat, union_feat, pose_feat = _unpack_batch(
+                batch, device, has_visual=has_visual, use_union=use_union,
+                use_pose=use_pose)
 
             logits = model(subj, obj, geo,
                            subj_feat=subj_feat, obj_feat=obj_feat,
@@ -546,16 +653,11 @@ def main():
     dataset_size = len(full_ds)
     num_labels = len(label_vocab)
     num_predicates = len(pred_vocab)
-    # VISUAL_FILTER_ONLY is what makes the four-way feature ablation a valid
-    # comparison. Turning visual features on changes the sample population
-    # (require_visual drops pairs whose crops are missing or degenerate), so a
-    # geometry run with use_visual=False would be scored on a DIFFERENT and
-    # larger test set than the CLIP runs — the variants would differ in two
-    # ways at once. With this flag the control loads the same cache and keeps
-    # the same samples, and only the model's input width changes.
-    clip_dim = 0 if VISUAL_FILTER_ONLY else (full_ds.CLIP_DIM if USE_VISUAL else 0)
-    pose_dim = POSE_FEATURE_DIM if USE_POSE else 0
-    union_dim = UNION_FEATURE_DIM if USE_UNION else 0
+    dims = resolve_feature_dims(
+        use_visual=USE_VISUAL, visual_filter_only=VISUAL_FILTER_ONLY,
+        use_union=USE_UNION, use_pose=USE_POSE, geo_mode=GEO_MODE,
+    )
+    clip_dim, pose_dim, union_dim = dims["clip_dim"], dims["pose_dim"], dims["union_dim"]
 
     # CLIP coverage
     print(f"\n  Dataset Statistics:")
@@ -578,8 +680,10 @@ def main():
     elif USE_VISUAL and not REQUIRE_VISUAL:
         real_clip, zero_clip, clip_coverage = analyze_clip_coverage(full_ds)
 
-    geo_dim = full_ds.geo_dim
-    input_dim = 2 * EMBED_DIM + geo_dim + 2 * clip_dim + union_dim + pose_dim
+    geo_dim = dims["geo_dim"]
+    if full_ds.geo_dim != geo_dim:
+        raise SystemExit(f"[train] dataset geometry width {full_ds.geo_dim} != "
+                         f"{geo_dim} expected for geo_mode={GEO_MODE}")
 
     if MODEL_TYPE == "transformer":
         model = RelationTransformer(
@@ -609,6 +713,11 @@ def main():
         ).to(device)
 
     param_count = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    # RelationMLP sizes its first Linear from its own feature_blocks(); report
+    # that value rather than re-deriving it, so the log cannot disagree with
+    # the weights.
+    input_dim = getattr(model, "input_dim",
+                        2 * EMBED_DIM + geo_dim + 2 * clip_dim + union_dim + pose_dim)
 
     print(f"\n  Model Configuration:")
     print(f"  Model type:               {MODEL_TYPE}")
@@ -663,6 +772,12 @@ def main():
         num_workers=0, pin_memory=False, collate_fn=_collate,
     )
 
+    # One definition of the batch layout for every consumer below: preflight,
+    # the training loop, per-epoch validation and the best-model analysis.
+    feature_flags = dict(has_visual=USE_VISUAL, use_union=USE_UNION, use_pose=USE_POSE)
+    preflight_feature_dims(model, {"train": train_ds, "val": val_ds}, device,
+                           **feature_flags)
+
     # -----------------------------------------------------------------------
     # STEP 3 - Training Setup
     # -----------------------------------------------------------------------
@@ -713,24 +828,8 @@ def main():
     best_select_score = -1.0
     best_epoch = 0
     has_visual = USE_VISUAL
-    has_union = USE_UNION
-    has_pose = USE_POSE
     all_batch_times = []
     epoch_metrics_log = []
-
-    def _unpack_batch(batch):
-        subj = batch[0].to(device)
-        obj = batch[1].to(device)
-        geo = batch[2].to(device)
-        pred = batch[3].to(device)
-        idx = 4
-        subj_feat = batch[idx].to(device) if has_visual else None
-        obj_feat = batch[idx + 1].to(device) if has_visual else None
-        idx += 2 if has_visual else 0
-        union_feat = batch[idx].to(device) if has_union else None
-        idx += 1 if has_union else 0
-        pose_feat = batch[idx].to(device) if has_pose else None
-        return subj, obj, geo, pred, subj_feat, obj_feat, union_feat, pose_feat
 
     for epoch in range(1, EPOCHS + 1):
         model.train()
@@ -741,7 +840,8 @@ def main():
 
         for batch in train_loader:
             batch_start = time.time()
-            subj, obj, geo, pred, subj_feat, obj_feat, union_feat, pose_feat = _unpack_batch(batch)
+            subj, obj, geo, pred, subj_feat, obj_feat, union_feat, pose_feat = _unpack_batch(
+                batch, device, **feature_flags)
 
             optimizer.zero_grad()
 
@@ -770,8 +870,7 @@ def main():
 
         # Validation
         val_metrics, confusion_counts, val_preds, val_targets = compute_predicate_metrics(
-            model, val_loader, device, pred_vocab, has_visual,
-            use_union=has_union, use_pose=has_pose,
+            model, val_loader, device, pred_vocab, **feature_flags,
         )
 
         overall_val_correct = sum(m["correct"] for m in val_metrics.values())
@@ -832,8 +931,10 @@ def main():
     print(f"{'=' * 78}")
 
     _load_best_model(model, str(CHECKPOINT_DIR), device)
+    # This call used to omit use_union/use_pose: the union arm's best model
+    # was handed union_feat=None here, after every epoch had finished.
     best_metrics, best_confusion, _, _ = compute_predicate_metrics(
-        model, val_loader, device, pred_vocab, has_visual
+        model, val_loader, device, pred_vocab, **feature_flags,
     )
 
     print_predicate_table(best_metrics, "Per-Predicate Validation Accuracy (Best Model)")
@@ -1015,6 +1116,12 @@ def _save_checkpoint(model, label_vocab, pred_vocab, ckpt_dir, epoch, val_acc,
     # the ablation would be comparing two different test sets.
     config["visual_filter_only"] = VISUAL_FILTER_ONLY
     config["require_visual"] = REQUIRE_VISUAL
+    # The first layer's exact width and the blocks that make it up, read off
+    # the model. eval_gt_relations.py refuses a checkpoint whose rebuilt model
+    # disagrees with input_dim.
+    if hasattr(model, "feature_blocks"):
+        config["input_dim"] = model.input_dim
+        config["feature_blocks"] = [[name, width] for name, width in model.feature_blocks()]
 
     torch.save({"model_state_dict": state, "model_config": config},
                os.path.join(ckpt_dir, "relation_mlp.pt"))
@@ -1043,6 +1150,12 @@ def _save_checkpoint(model, label_vocab, pred_vocab, ckpt_dir, epoch, val_acc,
         "predicate_scheme": PREDICATE_SCHEME,
         "geo_dim": config["geo_dim"],
         "geo_norm": config["geo_norm"],
+        # Read off the model: the geometry control loads CLIP but has
+        # clip_dim=0, and this used to record 768 for it.
+        "clip_dim": getattr(model, "clip_dim", 0),
+        "union_dim": getattr(model, "union_dim", 0),
+        "pose_dim": getattr(model, "pose_dim", 0),
+        "input_dim": getattr(model, "input_dim", None),
         "loss": LOSS,
         "class_weight_alpha": CLASS_WEIGHT_ALPHA,
         "select_metric": SELECT_METRIC,
@@ -1059,7 +1172,6 @@ def _save_checkpoint(model, label_vocab, pred_vocab, ckpt_dir, epoch, val_acc,
         meta["dataset_size"] = len(dataset)
         meta["num_labels"] = len(dataset.label_vocab)
         meta["num_predicates"] = len(dataset.pred_vocab)
-        meta["clip_dim"] = dataset.CLIP_DIM if USE_VISUAL else 0
         # Real CLIP coverage
         if USE_VISUAL:
             real, total, pct = dataset.compute_clip_coverage()
@@ -1479,6 +1591,7 @@ Examples:
                              "replaces random_split and is treated as "
                              "authoritative; test image IDs are never used.")
     args = parser.parse_args()
+    configure_safe_stdio()
 
     USE_VISUAL = args.use_visual
     REQUIRE_VISUAL = args.require_visual
