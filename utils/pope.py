@@ -1,5 +1,15 @@
 """
-POPE: Polling-based Object Probing Evaluation
+POPE: Polling-based Object Probing Evaluation  (LEGACY - not used by the caption experiment)
+
+Known limitation, still present: the positive probes are the objects the
+caption MENTIONS and the negative probes are objects it does NOT mention, so
+(a) the probe set depends on the caption - a caption naming more objects gets
+more probes - and (b) every negative probe is a true negative by construction,
+so a hallucination can never register as a false positive on a negative probe
+(it only shows up as fp among the positives, i.e. it duplicates CHAIR).
+Fixing the negative count at NUM_NEGATIVE_PROBES removed the length-dependent
+TN padding, not these two problems. The caption experiment uses the balanced,
+caption-independent probe set in utils/caption_hallucination.py instead.
 
 Evaluates object hallucination by constructing probing questions about
 whether objects mentioned in a caption are actually present in the image.

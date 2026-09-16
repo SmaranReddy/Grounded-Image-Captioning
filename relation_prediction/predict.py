@@ -948,8 +948,10 @@ def _set_geo_mode(config: dict, geo_dim: int) -> None:
     """
     global _model_geo_dim, _model_geo_mode, _model_geo_fn
     mode = config.get("geo_mode")
-    if mode not in ("basic", "ext"):
-        mode = "ext" if geo_dim == GEO_DIM_EXT else "basic"
+    if mode not in ("none", "basic", "ext"):
+        # geo_dim=0 is the clip_only ablation arm; without the "none" case its
+        # checkpoint was read back as "basic" and refused to load.
+        mode = "ext" if geo_dim == GEO_DIM_EXT else ("none" if geo_dim == 0 else "basic")
     _model_geo_fn, _model_geo_dim = geo_extractor(mode)
     _model_geo_mode = mode
     if _model_geo_dim != geo_dim:

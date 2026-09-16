@@ -275,7 +275,9 @@ two isolated crops do not.
 
 ## What is NOT part of this experiment
 
-* **Caption / hallucination evaluation** (CHAIR, POPE) needs `nltk` plus its
+* **Caption / hallucination evaluation** now has its own runbook:
+  [CAPTION_EXPERIMENTS.md](CAPTION_EXPERIMENTS.md) (no `nltk` needed). The note
+  below describes the legacy path. **Legacy:** CHAIR/POPE needs `nltk` plus its
   WordNet corpus (`python -c "import nltk; nltk.download('wordnet');
   nltk.download('omw-1.4')"`) and a separate caption ground-truth image set
   that is not currently available. `splits/e0_caption_gt_test.json` names 250

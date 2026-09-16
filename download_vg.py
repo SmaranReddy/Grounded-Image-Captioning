@@ -5,12 +5,15 @@ Downloads:
     1. relationships.json   — relation triples (subject, predicate, object)
     2. image_data.json      — image metadata (URLs, sizes)
     3. VG images (optional) — required for visual-semantic features
+    4. objects.json (optional, --objects) — every human-annotated object region;
+       the object ground truth for the caption hallucination experiment
 
 Usage:
     python download_vg.py                              # JSON only
     python download_vg.py --download-images            # JSON + images (108K, ~25 GB)
     python download_vg.py --download-images --max-images 5000   # subset for testing
     python download_vg.py --verify-images              # validate existing downloads
+    python download_vg.py --objects                    # + objects.json (caption GT)
 """
 
 from __future__ import annotations
@@ -36,12 +39,22 @@ FILES = {
     "image_data.json":    "https://homes.cs.washington.edu/~ranjay/visualgenome/data/dataset/image_data.json.zip",
 }
 
+# Not needed by the relation experiments, so not fetched by default. The caption
+# experiment's hallucination ground truth (build_caption_eval_set.py) needs it:
+# relationships.json only names the objects that take part in an annotated
+# relation, so an object a caption correctly mentions would be scored as a
+# hallucination whenever no annotator happened to relate it to anything.
+OPTIONAL_FILES = {
+    "objects.json": "https://homes.cs.washington.edu/~ranjay/visualgenome/data/dataset/objects.json.zip",
+}
+
 USER_AGENT = "Mozilla/5.0 (VG-Downloader; relation-prediction-project)"
 
 
-def download_json() -> None:
-    """Download relationships.json and image_data.json if missing."""
-    for filename, url in FILES.items():
+def download_json(include_objects: bool = False) -> None:
+    """Download relationships.json and image_data.json (and objects.json) if missing."""
+    files = dict(FILES, **(OPTIONAL_FILES if include_objects else {}))
+    for filename, url in files.items():
         dest = os.path.join(BASE_DIR, filename)
         if os.path.exists(dest):
             print(f"[skip] {filename} already exists.")
@@ -273,10 +286,15 @@ def main() -> None:
         "--seed", type=int, default=42,
         help="Random seed for reproducible subset sampling (default: 42)",
     )
+    parser.add_argument(
+        "--objects", action="store_true",
+        help="Also download objects.json (~55 MB zipped): the human object "
+             "annotations used as caption hallucination ground truth",
+    )
     args = parser.parse_args()
 
     # Always ensure JSON files are present.
-    download_json()
+    download_json(include_objects=args.objects)
 
     if args.verify_images:
         verify_images()

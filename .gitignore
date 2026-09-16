@@ -75,6 +75,18 @@ results_gpu/**
 !results_gpu/**/
 !results_gpu/**/*.json
 
+# Caption experiment (run_caption_experiment.py). Generated captions,
+# per-pair relation records and example images stay local; only the small
+# provenance/summary JSONs are trackable.
+results_caption/**
+!results_caption/**/
+!results_caption/relation_checkpoint_selection.json
+!results_caption/*/run_config.json
+!results_caption/*/caption_results.json
+!results_caption/*/caption_results.md
+!results_caption/*/smoke_report.json
+*.jsonl
+
 visualizations/
 eval_outputs/
 analysis_results/

@@ -36,13 +36,14 @@ _load_time: float = 0.0
 _MODEL_ID = "Salesforce/blip-image-captioning-base"
 
 
-def _load_model() -> None:
+def _load_model(dtype: Optional[torch.dtype] = None) -> None:
     global _processor, _model, _device, _load_time
 
     t0 = time.time()
 
     device_str = "cuda" if torch.cuda.is_available() else "cpu"
-    dtype      = torch.float16 if device_str == "cuda" else torch.float32
+    if dtype is None:
+        dtype = torch.float16 if device_str == "cuda" else torch.float32
 
     print(f"[BLIP] Loading {_MODEL_ID} on {device_str} …")
 
@@ -397,6 +398,85 @@ def build_blip_prefix(
         return BASELINE_PREFIX, []
 
     return f"{BASELINE_PREFIX} {' and '.join(parts)}", used
+
+
+def build_objects_only_prefix(relation: Dict) -> str:
+    """Control prefix: the SAME two objects as the relation prefix, no predicate.
+
+    "a photo of a person riding a bicycle" -> "a photo of a person and a bicycle".
+    Comparing the grounded arm against this separates the effect of the
+    predicted relation from the effect of merely naming two detected objects.
+    """
+    subject = str(relation["subject"]).replace("_", " ")
+    obj = str(relation["object"]).replace("_", " ")
+    return (f"{BASELINE_PREFIX} {_indefinite_article(subject)} {subject} and "
+            f"{_indefinite_article(obj)} {obj}")
+
+
+# Decoding parameters shared by EVERY arm of the caption experiment. These are
+# the values generate_blip_baseline / generate_blip_semantic_caption already
+# used; only the text prefix differs between arms.
+EXPERIMENT_GENERATION_CONFIG: Dict = {
+    "max_new_tokens": 128,
+    "num_beams": 4,
+    "early_stopping": True,
+    "do_sample": False,
+}
+
+
+def _normalise_space(text: str) -> str:
+    return " ".join(text.lower().split())
+
+
+def blip_model_info() -> Dict:
+    if _model is None:
+        return {"loaded": False}
+    return {"loaded": True, "model_id": _MODEL_ID, "device": str(_device),
+            "dtype": str(next(_model.parameters()).dtype).replace("torch.", "")}
+
+
+def generate_blip_from_prefix(
+    image,
+    prefix: str,
+    dtype: Optional[torch.dtype] = None,
+    generation_config: Optional[Dict] = None,
+) -> Dict:
+    """Caption `image` starting from `prefix`, with no post-processing at all.
+
+    The experiment's only generation entry point: the baseline, grounded and
+    control arms all call this with the same image preprocessing and the same
+    decoding parameters, one image at a time (batched beam search can differ
+    numerically from unbatched, which would be a confound). No relation
+    correction and no evidence gating run here - both depend on YOLO and would
+    change captions for reasons other than the relation.
+
+    Returns the decoded caption, the exact prefix, the token ids BLIP was
+    conditioned on, and whether the caption actually begins with the prefix.
+    """
+    global _processor, _model, _device
+
+    if _model is None:
+        _load_model(dtype=dtype)
+    elif dtype is not None and next(_model.parameters()).dtype != dtype:
+        raise RuntimeError(f"BLIP already loaded as {next(_model.parameters()).dtype}, "
+                           f"requested {dtype}")
+
+    cfg = dict(EXPERIMENT_GENERATION_CONFIG if generation_config is None else generation_config)
+    pil_image = _to_pil(image)
+    inputs = _processor(images=pil_image, text=prefix, return_tensors="pt").to(_device)
+    inputs["pixel_values"] = inputs["pixel_values"].to(dtype=next(_model.parameters()).dtype)
+
+    with torch.inference_mode():
+        output_ids = _model.generate(**inputs, **cfg)
+
+    caption = " ".join(_processor.decode(output_ids[0], skip_special_tokens=True).split())
+    return {
+        "caption": caption,
+        "prefix": prefix,
+        "input_ids": [int(t) for t in inputs["input_ids"][0].tolist()],
+        "prefix_echoed": _normalise_space(caption).startswith(_normalise_space(prefix)),
+        "generation_config": cfg,
+    }
 
 
 def _strip_prefix_artifacts(caption: str, prefix: str) -> str:

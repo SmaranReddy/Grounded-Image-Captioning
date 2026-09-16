@@ -1,5 +1,13 @@
 """
-grounded_caption_pipeline.py — Integrated grounded caption generation.
+grounded_caption_pipeline.py — Integrated grounded caption generation (LEGACY DEMO).
+
+NOT the caption experiment. run_caption_experiment.py is. This script's
+relation stage (predict.infer_relationships_semantic) softmaxes at T=2, adds
+hand-set prior bonuses, can override the model's argmax with a different
+predicate, and its caption stage adds relation correction and YOLO-based
+gating - so neither its relations nor its captions correspond to the relation
+model that was evaluated or to a prefix-only comparison with the baseline.
+See CAPTION_EXPERIMENTS.md.
 
 Full pipeline:
     Image → YOLO detection → CLIP crops → Relation MLP
@@ -80,7 +88,10 @@ from utils.eval_debug import (
 # Constants
 # ---------------------------------------------------------------------------
 
-CHECKPOINT_DIR = "./checkpoints"
+# ./checkpoints holds the 133-dim geometry-only E0 model. Point the REL_CKPT_DIR
+# environment variable at a visual checkpoint, e.g.
+# checkpoints_gpu/geometry_clip_union_seed42.
+CHECKPOINT_DIR = os.environ.get("REL_CKPT_DIR", "./checkpoints")
 SEMANTIC_PREDICATES = SEMANTIC_PREDS
 
 # ---------------------------------------------------------------------------
@@ -100,10 +111,18 @@ def verify_relation_model() -> Dict:
     rel_predict.load_relation_model(CHECKPOINT_DIR)
 
     embed_dim = rel_predict._model.label_emb.weight.shape[1]
-    in_dim = 2 * embed_dim + 5 + 2 * rel_predict._model_clip_dim
+    # Read the width off the model. The old formula `2*embed + 5 + 2*clip`
+    # ignored the geometry width (19 for ext) and the union block (768), so a
+    # 2451-dim geometry+CLIP+union checkpoint was reported as 1669 and passed
+    # the `== 1669` assert below by coincidence, while the 133-dim E0 model in
+    # ./checkpoints failed it.
+    in_dim = int(rel_predict._model.input_dim)
 
     info = {
         "input_dim": in_dim,
+        "feature_blocks": rel_predict._model.feature_blocks(),
+        "geo_dim": rel_predict._model_geo_dim,
+        "union_dim": rel_predict._model_union_dim,
         "clip_dim": rel_predict._model_clip_dim,
         "embed_dim": embed_dim,
         "num_labels": len(rel_predict._label_vocab),
@@ -120,11 +139,16 @@ def verify_relation_model() -> Dict:
     print(f"  Visual mode:         {info['visual_mode']}")
     print(f"  Device:              {info['device']}")
     print(f"  Embed dim:           {info['embed_dim']}")
+    print(f"  Feature blocks:      {info['feature_blocks']}")
 
-    assert info["input_dim"] == 1669, (
-        f"Expected input_dim=1669 but got {info['input_dim']}"
+    blocks_total = sum(w for _, w in info["feature_blocks"])
+    assert blocks_total == info["input_dim"], (
+        f"feature blocks sum to {blocks_total} but the model expects {info['input_dim']}"
     )
-    assert info["visual_mode"], "Model must be in visual-semantic mode (clip_dim > 0)"
+    assert info["visual_mode"], (
+        f"Model must be in visual-semantic mode (clip_dim > 0); {CHECKPOINT_DIR} is "
+        "geometry-only. Set REL_CKPT_DIR to a visual checkpoint."
+    )
 
     return info
 
@@ -383,11 +407,17 @@ def run_grounded_pipeline(
               f"trust={d['verification_score']:.2f})")
 
     if len(detections) < 2:
+        # Safe fallback: an actual BLIP caption from the baseline prefix, marked
+        # as ungrounded. This used to return the string "Only one object
+        # detected - cannot infer relations." AS the caption, which any
+        # downstream scorer would treat as a (hallucination-free) caption.
         result["relations"] = []
         result["raw_predictions"] = []
         result["verbalized_relations"] = []
         result["semantic_prompt"] = ""
-        result["caption"] = "Only one object detected — cannot infer relations."
+        result["caption"] = generate_blip_baseline(image)
+        result["relation_used"] = False
+        result["fallback_reason"] = "fewer_than_2_verified_detections"
         return result
 
     # ── STEP 2 — Calibrated semantic relation inference ─────────
@@ -403,8 +433,11 @@ def run_grounded_pipeline(
     if not relations:
         result["verbalized_relations"] = []
         result["semantic_prompt"] = ""
-        result["caption"] = "No semantic interactions detected."
+        result["caption"] = generate_blip_baseline(image)
+        result["relation_used"] = False
+        result["fallback_reason"] = "no_relation_after_filtering"
         return result
+    result["relation_used"] = True
 
     # ── STEP 3 — Verbalize + build semantic prompt ──────────────
     #   Sub-steps:
@@ -1263,7 +1296,7 @@ def main():
     print(f"  PIPELINE COMPLETE — PRECISION-ORIENTED")
     print(f"{'=' * 70}")
     print(f"  Images processed:        {len(all_results)}")
-    print(f"  Model:                   visual-semantic (1669-dim input)")
+    print(f"  Model:                   visual-semantic ({model_info['input_dim']}-dim input)")
     print(f"  Output directory:        {output_root.resolve()}")
     print(f"  Total relations:         {total_rels}")
     print(f"  Total semantic preds:    {total_sems}")

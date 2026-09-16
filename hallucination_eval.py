@@ -1,5 +1,33 @@
 """
-hallucination_eval.py — Dedicated hallucination stress-test evaluation suite.
+hallucination_eval.py — hallucination evaluation.
+
+TWO MODES
+=========
+1. Caption experiment (use this):
+
+       python hallucination_eval.py --run-dir results_caption/main
+
+   Scores the captions run_caption_experiment.py generated (baseline /
+   relation-grounded / objects-only control, identical images and decoding)
+   against human Visual Genome object annotations, with corpus-level CHAIR, a
+   balanced caption-independent POPE probe set, paired bootstrap confidence
+   intervals and validity checks that the relation actually reached BLIP.
+   Implementation: utils/caption_experiment_eval.py.
+
+2. Legacy stress test (below; kept for reference, DO NOT report its numbers):
+   - default ground truth is YOLO's own detections, circular for a system
+     conditioned on YOLO;
+   - its "grounded" system adds YOLO-based caption gating/repair and a
+     template fallback, so it differs from the baseline in more than the
+     relation;
+   - its POPE (utils/pope.py) builds positive probes from the objects the
+     caption mentions and negative probes from objects it does not, so every
+     negative is a true negative by construction and the probe set depends on
+     the caption;
+   - utils.metrics.detect_coco_objects misses plurals and double-counts
+     "hot dog" as hot dog + dog.
+
+Legacy description:
 
 Runs all three systems on the hallucination-prone image set:
     1. BLIP-2 baseline (implicit captioning)
@@ -37,21 +65,28 @@ from collections import Counter
 from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple
 
-from PIL import Image
-from tqdm import tqdm
 
-from evaluate import (
-    run_system_blip2,
-    run_system_blip2_clip,
-    run_system_grounded,
-    run_yolo,
-    yolo_detections_to_objects,
-    _SYSTEM_NAMES,
-    _list_image_paths,
-)
-from utils.metrics import compute_chair, validate_chair_schema
-from utils.pope import compute_pope
-from utils.clip_scorer import get_clip_scorer
+
+def _legacy_imports() -> None:
+    """The legacy mode pulls in YOLO, BLIP and NLTK-backed metrics; the caption
+    experiment mode needs none of them, so they are imported only on demand."""
+    global Image, tqdm, run_system_blip2, run_system_blip2_clip, run_system_grounded
+    global run_yolo, yolo_detections_to_objects, _SYSTEM_NAMES, _list_image_paths
+    global compute_chair, validate_chair_schema, compute_pope, get_clip_scorer
+    from PIL import Image
+    from tqdm import tqdm
+    from evaluate import (
+        run_system_blip2,
+        run_system_blip2_clip,
+        run_system_grounded,
+        run_yolo,
+        yolo_detections_to_objects,
+        _SYSTEM_NAMES,
+        _list_image_paths,
+    )
+    from utils.metrics import compute_chair, validate_chair_schema
+    from utils.pope import compute_pope
+    from utils.clip_scorer import get_clip_scorer
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -722,8 +757,22 @@ def run_hallucination_eval(args):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Hallucination stress-test evaluation suite.",
+        description="Hallucination evaluation. Use --run-dir for the caption experiment.",
     )
+    parser.add_argument(
+        "--run-dir", type=str, default=None,
+        help="Caption-experiment run directory (run_caption_experiment.py). "
+             "Selects the fair evaluation; all legacy options are ignored.",
+    )
+    parser.add_argument(
+        "--eval-set", type=str, default=None,
+        help="Caption evaluation set (default: the one recorded in run_config.json)",
+    )
+    parser.add_argument("--bootstrap", type=int, default=10000,
+                        help="Paired bootstrap resamples (caption experiment)")
+    parser.add_argument("--no-clipscore", action="store_true",
+                        help="Skip CLIPScore (caption experiment)")
+    parser.add_argument("--allow-small", action="store_true", help=argparse.SUPPRESS)
 
     parser.add_argument(
         "--image-dir", type=str, default=HALLUCINATION_IMAGE_DIR,
@@ -739,7 +788,7 @@ def main():
     )
     parser.add_argument(
         "--systems", type=str, nargs="+",
-        choices=list(_SYSTEM_NAMES.keys()), default=None,
+        choices=["blip2", "blip2_clip", "grounded"], default=None,
         help="Systems to evaluate (default: all three)",
     )
     parser.add_argument(
@@ -762,6 +811,21 @@ def main():
 
     args = parser.parse_args()
 
+    if args.run_dir:
+        from utils.caption_experiment_eval import evaluate_run
+        start = time.time()
+        results = evaluate_run(args.run_dir, args.eval_set, allow_small=args.allow_small,
+                               n_bootstrap=args.bootstrap, seed=args.seed,
+                               clipscore=not args.no_clipscore)
+        print((Path(args.run_dir) / "caption_results.md").read_text(encoding="utf-8"))
+        print(f"[hallucination_eval] wrote {Path(args.run_dir) / 'caption_results.json'} "
+              f"({results['n_images']} images, {time.time() - start:.1f}s)")
+        return
+
+    print("[hallucination_eval] LEGACY MODE: circular YOLO ground truth by default, "
+          "gating confounds and a non-balanced POPE. Do not report these numbers; "
+          "use --run-dir for the caption experiment.")
+    _legacy_imports()
     from utils.seed import set_seed
     set_seed(args.seed)
     load_gt_objects(args.gt_objects_json)
@@ -773,4 +837,6 @@ def main():
 
 
 if __name__ == "__main__":
+    from utils.console import configure_safe_stdio
+    configure_safe_stdio()
     main()

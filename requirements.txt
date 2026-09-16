@@ -26,6 +26,8 @@ matplotlib            # plots in utils/eval_debug.py and report/
 accelerate            # transformers device_map for the BLIP captioner
 
 # --- caption / hallucination arm (CHAIR, POPE) -----------------------------
+# The caption experiment (CAPTION_EXPERIMENTS.md) needs only ultralytics +
+# transformers; nltk is used by the LEGACY evaluate.py / hallucination_eval.py.
 # nltk ALSO needs its WordNet corpus, which pip does not install:
 #     python -c "import nltk; nltk.download('wordnet'); nltk.download('omw-1.4')"
 # Without it detect_coco_objects() raises and CHAIR/POPE cannot run.
