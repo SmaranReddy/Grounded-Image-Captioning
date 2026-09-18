@@ -326,7 +326,46 @@ annotators did not use (e.g. a laptop bag as `handbag`), which is counted
 against the arm that says it — this is why the prefix-vs-continuation split is
 reported; relation confidences are uncalibrated.
 
-No caption-level conclusion exists until this has been run.
+## RESULT (run, frozen, not to be re-opened)
+
+The run above was executed on the GPU machine over all 250 test images. Its
+numbers are final; this experiment is **closed**.
+
+| metric | baseline | grounded | objects_only |
+|---|---|---|---|
+| CHAIR_i | 4.11% | 8.30% | 8.35% |
+| CHAIR_s | 5.20% | 15.60% | 15.60% |
+| hallucinated objects / caption | 0.056 | 0.160 | 0.160 |
+| mentioned objects / caption | 1.364 | 1.928 | 1.916 |
+| object recall | 40.67% | 54.98% | 54.60% |
+| POPE random F1 | 60.85% | 74.04% | 73.85% |
+| POPE popular F1 | 60.79% | 73.54% | 73.42% |
+| POPE adversarial F1 | 60.72% | 73.33% | 73.28% |
+| CLIPScore | 0.7115 | 0.6733 | 0.6776 |
+
+Relation injected in 227/250 images (90.8%). Paired grounded - baseline, 95%
+bootstrap CI over images: CHAIR_i **+4.19 pt [1.49, 6.89]**, CHAIR_s **+10.40 pt
+[6.00, 14.80]**, POPE-adversarial F1 **+12.61 pt [9.49, 15.77]**, object recall
+**+14.30 pt [11.46, 17.21]**, CLIPScore -0.04. Grounded - objects_only shows no
+meaningful difference on CHAIR_i, CHAIR_s, POPE-adversarial F1 or CLIPScore.
+
+Against the pre-registered reading rules this is **outcome B'** on CHAIR with a
+**C**-shaped trade-off: the relation prefix significantly *increases*
+hallucination while significantly increasing object recall and POPE F1 - and
+the objects-only control moves every metric by the same amount, so none of it
+is attributable to the predicate.
+
+What may be said: *adding verified object names to BLIP's prefix makes it name
+more objects, right and wrong alike.* What may **not** be said: that relation
+grounding reduces hallucination. It does not.
+
+The follow-up, which treats the prediction as evidence for reranking instead of
+as a mandatory sentence fragment, is **`CAPTION_RERANKING.md`**. It reuses this
+image set, these detections and these three arms unchanged and adds two more.
+
+---
+
+No caption-level conclusion beyond the above may be drawn from this run.
 
 ---
 
@@ -344,6 +383,14 @@ No caption-level conclusion exists until this has been run.
 | `run is not scoreable` | a prefix/relation/caption inconsistency | send the printed problem list; do not report metrics |
 | NaN / empty captions with `--blip-dtype float16` | fp16 on GTX 16xx | use the default float32 |
 | CUDA out of memory in `detect` | other processes on the GPU | close them; or `--device cpu` (slow but identical) |
+
+## Reranking arms (second experiment)
+
+`run_caption_experiment.py` also carries the `candidates`, `tune-rerank` and
+`rerank` stages, and `hallucination_eval.py --run-dir` scores the
+`object_reranked` and `relation_reranked` arms alongside the three above
+whenever they are present. They are additive: a run directory with only the
+three prefix arms scores exactly as it did before. See `CAPTION_RERANKING.md`.
 
 ## Legacy scripts (not part of this experiment)
 
