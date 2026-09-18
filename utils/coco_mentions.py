@@ -297,21 +297,34 @@ def tokenize(text: str) -> List[str]:
     return [_singular(t) for t in _TOKEN_RE.findall(text.lower())]
 
 
-def mention_spans(text: str) -> List[Tuple[str, Optional[str]]]:
-    """Every matched phrase in order: (matched singular phrase, COCO class or None)."""
+def located_mention_spans(text: str) -> List[Tuple[int, int, str, Optional[str]]]:
+    """Every matched phrase in order, with its token span: (start, end, phrase, class).
+
+    `start`/`end` index into `tokenize(text)` (end exclusive). Same greedy
+    longest-phrase-first scan as `mention_spans`, which delegates here, so the
+    two can never disagree about what a caption mentions. The positions let a
+    caller ask a question the class set cannot answer - whether a predicate
+    word sits BETWEEN the subject and object mentions - without a second,
+    divergent tokenizer.
+    """
     tokens = tokenize(text)
-    spans: List[Tuple[str, Optional[str]]] = []
+    spans: List[Tuple[int, int, str, Optional[str]]] = []
     i = 0
     while i < len(tokens):
         for n in range(min(_MAX_PHRASE, len(tokens) - i), 0, -1):
             key = tuple(tokens[i:i + n])
             if key in _PHRASES:
-                spans.append((" ".join(key), _PHRASES[key]))
+                spans.append((i, i + n, " ".join(key), _PHRASES[key]))
                 i += n
                 break
         else:
             i += 1
     return spans
+
+
+def mention_spans(text: str) -> List[Tuple[str, Optional[str]]]:
+    """Every matched phrase in order: (matched singular phrase, COCO class or None)."""
+    return [(phrase, cls) for _, _, phrase, cls in located_mention_spans(text)]
 
 
 def mentions(text: str) -> Set[str]:
