@@ -39,7 +39,9 @@ from utils.caption_hallucination import (
     score_pope,
 )
 
-ARMS = ("baseline", "grounded", "objects_only")
+PREFIX_ARMS = ("baseline", "grounded", "objects_only")
+RERANK_ARMS = ("object_reranked", "relation_reranked")
+ARMS = PREFIX_ARMS + RERANK_ARMS
 REQUIRED_ARMS = ("baseline", "grounded")
 MIN_FINAL_IMAGES = 100
 EXPLORATORY_THRESHOLDS = (0.0, 0.3, 0.5, 0.7, 0.9)
@@ -91,7 +93,8 @@ def expected_prefix(arm: str, relation: Optional[Mapping], threshold: float) -> 
 # ---------------------------------------------------------------------------
 
 def validate_run(ids: Sequence[str], relations: Mapping[str, Mapping],
-                 arms: Mapping[str, Mapping[str, Mapping]], threshold: float) -> Dict:
+                 arms: Mapping[str, Mapping[str, Mapping]], threshold: float,
+                 candidates: Optional[Mapping[str, Mapping]] = None) -> Dict:
     """Check that each arm used exactly the prefix its rule implies.
 
     Hard problems (wrong prefix, a relation that should have been injected but
@@ -99,6 +102,8 @@ def validate_run(ids: Sequence[str], relations: Mapping[str, Mapping],
     reported: prefix not echoed, fallback regeneration differing from baseline.
     """
     from utils.blip_captioner import BASELINE_PREFIX
+
+    candidates = candidates or {}
 
     problems: List[str] = []
     stats: Dict[str, Dict] = {}
@@ -110,18 +115,21 @@ def validate_run(ids: Sequence[str], relations: Mapping[str, Mapping],
             rel_rec = relations[iid]
             selected = rel_rec.get("selected_relation")
             decision = rel_rec.get("decision", {})
-            want = expected_prefix(arm, selected, threshold)
-            if rec.get("prefix") != want:
-                problems.append(f"{arm}/{iid}: prefix {rec.get('prefix')!r} != expected {want!r}")
             used = bool(rec.get("relation_used"))
-            should_use = arm != "baseline" and bool(decision.get("use_relation"))
-            if used != should_use:
-                problems.append(f"{arm}/{iid}: relation_used={used} but decision says {should_use}")
-            if used and rec.get("prefix") == BASELINE_PREFIX:
-                problems.append(f"{arm}/{iid}: relation marked used but baseline prefix sent to BLIP")
-            if used and base[iid].get("input_ids") == rec.get("input_ids"):
-                problems.append(f"{arm}/{iid}: BLIP input ids identical to baseline despite relation")
             caption = str(rec.get("caption", ""))
+            if arm in RERANK_ARMS:
+                problems += _rerank_problems(arm, iid, rec, candidates, selected)
+            else:
+                want = expected_prefix(arm, selected, threshold)
+                if rec.get("prefix") != want:
+                    problems.append(f"{arm}/{iid}: prefix {rec.get('prefix')!r} != expected {want!r}")
+                should_use = arm != "baseline" and bool(decision.get("use_relation"))
+                if used != should_use:
+                    problems.append(f"{arm}/{iid}: relation_used={used} but decision says {should_use}")
+                if used and rec.get("prefix") == BASELINE_PREFIX:
+                    problems.append(f"{arm}/{iid}: relation marked used but baseline prefix sent to BLIP")
+                if used and base[iid].get("input_ids") == rec.get("input_ids"):
+                    problems.append(f"{arm}/{iid}: BLIP input ids identical to baseline despite relation")
             if not caption.strip():
                 problems.append(f"{arm}/{iid}: empty caption")
             if any(p in caption.lower() for p in LEGACY_PLACEHOLDERS):
@@ -129,14 +137,45 @@ def validate_run(ids: Sequence[str], relations: Mapping[str, Mapping],
             s["n"] += 1
             s["relation_used"] += int(used)
             s["prefix_echoed"] += int(bool(rec.get("prefix_echoed")))
-            if arm != "baseline" and not used:
-                s["fallback"] += 1
-                if caption != base[iid].get("caption"):
-                    s["fallback_regeneration_differs_from_baseline"] += 1
-            if arm != "baseline" and used and caption != base[iid].get("caption"):
-                s["caption_differs_from_baseline"] += 1
+            if arm in RERANK_ARMS:
+                s["caption_differs_from_baseline"] += int(caption != base[iid].get("caption"))
+                s["changed_from_first_candidate"] += int(bool(rec.get("changed_from_first_candidate")))
+                s["changed_by_relation_term"] += int(bool(rec.get("changed_by_relation_term")))
+            else:
+                if arm != "baseline" and not used:
+                    s["fallback"] += 1
+                    if caption != base[iid].get("caption"):
+                        s["fallback_regeneration_differs_from_baseline"] += 1
+                if arm != "baseline" and used and caption != base[iid].get("caption"):
+                    s["caption_differs_from_baseline"] += 1
         stats[arm] = dict(s)
     return {"problems": problems, "per_arm": stats}
+
+
+def _rerank_problems(arm: str, iid: str, rec: Mapping,
+                     candidates: Mapping[str, Mapping], relation) -> List[str]:
+    """A reranked caption must be one of the candidates BLIP actually produced,
+    and must be the top-scoring one. A reranking arm has no prefix rule to
+    satisfy: the prefix it reports is the prefix of whichever candidate won."""
+    problems: List[str] = []
+    pool = (candidates.get(iid) or {}).get("candidates")
+    if pool is None:
+        problems.append(f"{arm}/{iid}: no candidate pool recorded "
+                        "(candidates.jsonl is missing this image)")
+        return problems
+    texts = {str(c["text"]) for c in pool}
+    if not texts:
+        problems.append(f"{arm}/{iid}: empty candidate pool")
+    elif str(rec.get("caption")) not in texts:
+        problems.append(f"{arm}/{iid}: selected caption is not one of the "
+                        f"{len(texts)} generated candidates")
+    scores = rec.get("scores") or []
+    if scores and str(scores[0].get("text")) != str(rec.get("caption")):
+        problems.append(f"{arm}/{iid}: selected caption is not the top-scoring candidate")
+    if rec.get("relation_used") and relation is None:
+        problems.append(f"{arm}/{iid}: caption marked as stating a relation "
+                        "but none was predicted")
+    return problems
 
 
 # ---------------------------------------------------------------------------
@@ -185,6 +224,73 @@ def relation_statistics(ids: Sequence[str], relations: Mapping[str, Mapping]) ->
         "predicates_used": dict(predicates_used.most_common()),
         "mean_raw_detections_per_image": c["raw_detections"] / n if n else 0.0,
         "mean_verified_detections_per_image": c["verified_detections"] / n if n else 0.0,
+    }
+
+
+def rerank_statistics(ids: Sequence[str], recs: Mapping[str, Mapping],
+                      candidates: Mapping[str, Mapping]) -> Dict:
+    """How the reranker behaved - reported for every reranking arm.
+
+    None of this is a quality metric; it describes how often the reranker
+    departed from BLIP's own first choice, where the caption it kept came
+    from, and (for the relation arm) how often the relation term is what
+    changed the answer.
+    """
+    n = len(ids)
+    pool_sizes, scored, dropped, margins, scores = [], [], [], [], []
+    sources, dropped_reasons = Counter(), Counter()
+    changed = changed_by_relation = states_relation = 0
+    confidences = []
+    for iid in ids:
+        rec = recs[iid]
+        pool = (candidates.get(iid) or {}).get("candidates") or []
+        pool_sizes.append(len(pool))
+        scored.append(int(rec.get("n_candidates_scored", 0)))
+        dropped.append(int(rec.get("n_candidates_dropped", 0)))
+        for d in rec.get("dropped") or []:
+            dropped_reasons[d.get("reason")] += 1
+        sources[rec.get("source")] += 1
+        changed += int(bool(rec.get("changed_from_first_candidate")))
+        changed_by_relation += int(bool(rec.get("changed_by_relation_term")))
+        states_relation += int(bool(rec.get("relation_used")))
+        ranked = rec.get("scores") or []
+        if ranked:
+            scores.append(float(ranked[0]["score"]))
+            if len(ranked) > 1:
+                margins.append(float(ranked[0]["score"]) - float(ranked[1]["score"]))
+        rel = rec.get("relation")
+        if rel and rec.get("relation_used"):
+            confidences.append(float(rel["confidence"]))
+
+    def _stats(xs):
+        if not xs:
+            return None
+        ordered = sorted(xs)
+        mid = len(ordered) // 2
+        return {"min": ordered[0], "max": ordered[-1],
+                "mean": sum(ordered) / len(ordered),
+                "median": (ordered[mid] if len(ordered) % 2
+                           else 0.5 * (ordered[mid - 1] + ordered[mid]))}
+
+    return {
+        "n_images": n,
+        "candidates_per_image": _stats(pool_sizes),
+        "candidates_scored_per_image": _stats(scored),
+        "candidates_dropped_total": sum(dropped),
+        "dropped_reasons": dict(dropped_reasons),
+        "candidate_generation_success_rate":
+            sum(1 for x in scored if x > 0) / n if n else 0.0,
+        "selected_score": _stats(scores),
+        "selected_margin_over_runner_up": _stats(margins),
+        "selected_candidate_source": dict(sources),
+        "changed_from_first_candidate": changed,
+        "changed_from_first_candidate_rate": changed / n if n else 0.0,
+        "changed_by_relation_term": changed_by_relation,
+        "changed_by_relation_term_rate": changed_by_relation / n if n else 0.0,
+        "captions_stating_the_predicted_relation": states_relation,
+        "relation_usage_rate": states_relation / n if n else 0.0,
+        "mean_confidence_of_stated_relations":
+            (sum(confidences) / len(confidences)) if confidences else None,
     }
 
 
@@ -293,15 +399,22 @@ def evaluate_run(run_dir, eval_set_path: Optional[str] = None, allow_small: bool
             raise FileNotFoundError(f"{path} missing - generate the {arm} arm first")
     check_pairing(ids, arms)
 
-    validity = validate_run(ids, relations, arms, threshold)
+    cand_path = run_dir / "candidates.jsonl"
+    candidates = keyed(read_jsonl(cand_path), cand_path.name) if cand_path.is_file() else {}
+    if any(arm in arms for arm in RERANK_ARMS) and not candidates:
+        raise FileNotFoundError(f"{cand_path} missing - a reranking arm cannot be "
+                                "verified without the candidate pool it chose from")
+
+    validity = validate_run(ids, relations, arms, threshold, candidates)
     if validity["problems"]:
         raise ValueError("run is not scoreable:\n  " + "\n  ".join(validity["problems"][:25]))
 
     # Captions used for metrics (fallback images -> the baseline arm's caption).
     scored_caption: Dict[str, Dict[str, str]] = {}
     for arm, recs in arms.items():
+        own = arm == "baseline" or arm in RERANK_ARMS
         scored_caption[arm] = {
-            iid: (recs[iid]["caption"] if (arm == "baseline" or recs[iid]["relation_used"])
+            iid: (recs[iid]["caption"] if (own or recs[iid]["relation_used"])
                   else arms["baseline"][iid]["caption"])
             for iid in ids
         }
@@ -323,12 +436,14 @@ def evaluate_run(run_dir, eval_set_path: Optional[str] = None, allow_small: bool
         # injected prefix was put there by YOLO + the relation model (or is a
         # real object the VG annotators named outside COCO-80); everything else
         # is BLIP's own continuation.
+        from utils.blip_captioner import BASELINE_PREFIX
         from_prefix = total = 0
         for iid in ids:
             hall = set(object_recs[arm][iid]["hallucinated"])
             total += len(hall)
-            if arm != "baseline" and arms[arm][iid].get("relation_used"):
-                n = len(hall & _mentions(arms[arm][iid]["prefix"]))
+            prefix = arms[arm][iid].get("prefix")
+            if arm != "baseline" and prefix and prefix != BASELINE_PREFIX:
+                n = len(hall & _mentions(prefix))
                 object_recs[arm][iid]["n_hallucinated_from_prefix"] = n
                 from_prefix += n
         metrics[arm]["hallucination_source"] = {
@@ -358,6 +473,14 @@ def evaluate_run(run_dir, eval_set_path: Optional[str] = None, allow_small: bool
     pairs = [("grounded", "baseline")]
     if "objects_only" in arms:
         pairs += [("objects_only", "baseline"), ("grounded", "objects_only")]
+    for rerank_arm in RERANK_ARMS:
+        if rerank_arm in arms:
+            pairs += [(rerank_arm, "baseline")]
+            if "objects_only" in arms:
+                pairs.append((rerank_arm, "objects_only"))
+            pairs.append((rerank_arm, "grounded"))
+    if all(a in arms for a in RERANK_ARMS):
+        pairs.append(("relation_reranked", "object_reranked"))
     for arm_b, arm_a in pairs:
         key = f"{arm_b}_minus_{arm_a}"
         comparisons[key] = {}
@@ -411,6 +534,12 @@ def evaluate_run(run_dir, eval_set_path: Optional[str] = None, allow_small: bool
         "arms_present": list(arms),
         "validity": validity,
         "relation_statistics": relation_statistics(ids, relations),
+        "rerank_statistics": {arm: rerank_statistics(ids, arms[arm], candidates)
+                              for arm in RERANK_ARMS if arm in arms},
+        "rerank_weights": {
+            arm: json.loads((run_dir / f"captions_{arm}.meta.json").read_text(encoding="utf-8"))
+            for arm in RERANK_ARMS
+            if arm in arms and (run_dir / f"captions_{arm}.meta.json").is_file()},
         "metrics_all_images": metrics,
         "metrics_relation_used_images": subset_metrics,
         "paired_comparisons": comparisons,
@@ -441,6 +570,11 @@ def evaluate_run(run_dir, eval_set_path: Optional[str] = None, allow_small: bool
                     **{k: object_recs[arm][iid][k] for k in
                        ("mentioned", "hallucinated", "n_mentioned", "n_hallucinated", "n_words")},
                 }
+                if arm in RERANK_ARMS:
+                    row["arms"][arm].update(
+                        {k: arms[arm][iid].get(k) for k in
+                         ("source", "beam_rank", "score", "changed_from_first_candidate",
+                          "changed_by_relation_term", "first_candidate")})
                 if clipscore:
                     row["arms"][arm]["clipscore"] = clip_scores[arm][iid]
             fh.write(json.dumps(row) + "\n")
@@ -528,6 +662,50 @@ def render_markdown(r: Mapping) -> str:
             L.append("| hallucinations in BLIP continuation | " + " | ".join(
                 str(metrics[a]["hallucination_source"]["in_blip_continuation"]) for a in arms) + " |")
         L.append("")
+
+    if r.get("rerank_statistics"):
+        L.append("## Reranking behaviour (descriptive, not a quality metric)\n")
+        wts = r.get("rerank_weights") or {}
+        for arm, st in r["rerank_statistics"].items():
+            meta = wts.get(arm, {})
+            sel = meta.get("weights_selected_on") or {}
+            L.append(f"**{arm}** - weights `{meta.get('weights')}` "
+                     f"(locked on {sel.get('n_images', '?')} {sel.get('split', '?')}-split "
+                     f"images, file sha256 `{str(meta.get('weights_file_sha256'))[:16]}`)\n")
+            cpi, sc = st["candidates_per_image"], st["selected_score"]
+            L.append("| statistic | value |")
+            L.append("|---|---|")
+            L.append(f"| candidates per image (K per prefix, pooled) | "
+                     f"min {cpi['min']}, median {cpi['median']}, max {cpi['max']}, "
+                     f"mean {cpi['mean']:.2f} |")
+            L.append(f"| candidate generation success rate | "
+                     f"{_pct(st['candidate_generation_success_rate'])} |")
+            L.append(f"| candidates dropped (degenerate) | {st['candidates_dropped_total']} "
+                     f"{st['dropped_reasons'] or ''} |")
+            L.append(f"| selected score | min {sc['min']:.3f}, median {sc['median']:.3f}, "
+                     f"max {sc['max']:.3f}, mean {sc['mean']:.3f} |")
+            m = st["selected_margin_over_runner_up"]
+            L.append(f"| margin over runner-up | median {m['median']:.4f}, "
+                     f"mean {m['mean']:.4f} |" if m else "| margin over runner-up | n/a |")
+            L.append(f"| selected candidate came from prefix | "
+                     f"{st['selected_candidate_source']} |")
+            L.append(f"| **top-ranked != BLIP's first candidate** | "
+                     f"{st['changed_from_first_candidate']}/{st['n_images']} "
+                     f"({_pct(st['changed_from_first_candidate_rate'])}) |")
+            if (meta.get("weights") or {}).get("w_rel"):
+                L.append(f"| **relation evidence changed the selection** | "
+                         f"{st['changed_by_relation_term']}/{st['n_images']} "
+                         f"({_pct(st['changed_by_relation_term_rate'])}) |")
+            else:
+                L.append("| relation evidence changed the selection | "
+                         "n/a (this arm has no relation term) |")
+            L.append(f"| captions stating the predicted relation | "
+                     f"{st['captions_stating_the_predicted_relation']}/{st['n_images']} "
+                     f"({_pct(st['relation_usage_rate'])}) |")
+            mc = st["mean_confidence_of_stated_relations"]
+            L.append(f"| mean confidence of stated relations | "
+                     f"{'n/a' if mc is None else f'{mc:.3f}'} |")
+            L.append("")
 
     table(r["metrics_all_images"], "Hallucination metrics - all images")
     if r["metrics_relation_used_images"]:

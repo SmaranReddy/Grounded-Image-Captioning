@@ -135,3 +135,40 @@ def test_builder_never_imports_a_detector_or_captioner(vg):
     out = subprocess.run([sys.executable, "-c", code], cwd=ROOT, capture_output=True, text=True)
     assert out.returncode == 0, out.stderr
     assert "IMPORTED []" in out.stdout
+
+
+# ---------------------------------------------------------------------------
+# The tuning set: same builder, validation split, disjoint from the test set
+# ---------------------------------------------------------------------------
+
+def test_validation_split_draws_only_validation_images(vg):
+    m = bces.build_manifest(_args(vg, split="val", limit=100, min_objects=1))
+    assert set(map(int, m["images"])) <= {50, 51}
+    assert m["meta"]["split"] == "val"
+
+
+def test_tuning_and_test_caption_sets_never_share_an_image(vg):
+    """Reranking weights are chosen on the validation set and the frozen test
+    set is scored once. If the two sets overlapped, that separation would be
+    a formality."""
+    test_set = bces.build_manifest(_args(vg, split="test", limit=100))
+    val_set = bces.build_manifest(_args(vg, split="val", limit=100, min_objects=1))
+    assert set(test_set["images"]).isdisjoint(set(val_set["images"]))
+
+
+def test_the_real_frozen_splits_are_disjoint_so_tuning_cannot_leak():
+    manifest = json.load(open(os.path.join(ROOT, "splits", "e0_image_split.json")))
+    val = {int(i) for i in manifest["val_ids"]}
+    test = {int(i) for i in manifest["test_ids"]}
+    assert val and test and val.isdisjoint(test)
+
+
+def test_shipped_caption_sets_are_disjoint_if_both_are_built():
+    """Guards the real artefacts once they exist on a machine."""
+    paths = [os.path.join(ROOT, "splits", "caption_eval_test_250.json"),
+             os.path.join(ROOT, "splits", "caption_eval_val_200.json")]
+    if not all(os.path.isfile(p) for p in paths):
+        pytest.skip("caption evaluation sets are not built on this machine")
+    test_set, val_set = (json.load(open(p, encoding="utf-8")) for p in paths)
+    assert test_set["meta"]["split"] == "test" and val_set["meta"]["split"] == "val"
+    assert set(map(str, test_set["usable_ids"])).isdisjoint(map(str, val_set["usable_ids"]))

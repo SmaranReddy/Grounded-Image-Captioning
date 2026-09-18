@@ -81,10 +81,13 @@ results_gpu/**
 results_caption/**
 !results_caption/**/
 !results_caption/relation_checkpoint_selection.json
+!results_caption/rerank_weights.json
 !results_caption/*/run_config.json
 !results_caption/*/caption_results.json
 !results_caption/*/caption_results.md
 !results_caption/*/smoke_report.json
+!results_caption/*/candidates.meta.json
+!results_caption/*/captions_*.meta.json
 *.jsonl
 
 visualizations/

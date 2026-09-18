@@ -1,19 +1,35 @@
-"""Caption experiment: does relation grounding change BLIP's object hallucination?
+"""Caption experiment: how should a predicted relation reach the caption?
 
 Same images, same BLIP checkpoint, same preprocessing, same decoding
-parameters; the ONLY thing that differs between arms is the text prefix BLIP
+parameters across every arm.
+
+Experiment 1 (CAPTION_EXPERIMENTS.md, CLOSED) varies only the text prefix BLIP
 continues from:
 
     baseline      "a photo of"
     grounded      "a photo of a person riding a bicycle"   (relation >= threshold)
     objects_only  "a photo of a person and a bicycle"      (control)
 
-Stages (each resumable; see CAPTION_EXPERIMENTS.md for the full runbook)
-------------------------------------------------------------------------
-    preflight          environment, data, split integrity, checkpoint
+Its result: the relation prefix increases object hallucination and the
+objects-only control matches it on every metric, so the predicate contributes
+nothing. A prefix is a mandatory assertion - the system cannot decline a wrong
+prediction.
+
+Experiment 2 (CAPTION_RERANKING.md) generates candidates from all three
+prefixes and CHOOSES between them with a deterministic, evidence-based score:
+
+    object_reranked    score without the relation term
+    relation_reranked  score with a confidence-weighted relation term
+
+Stages (each resumable; see the runbooks for the full procedure)
+----------------------------------------------------------------
+    preflight          environment, data, split integrity, checkpoint, weights
     select-checkpoint  pick the geometry+CLIP+union seed by VALIDATION top-1
-    detect             YOLO -> CLIP verification -> relation model   (relations.jsonl)
-    generate --arm A   BLIP captions for one arm                      (captions_A.jsonl)
+    detect             YOLO -> CLIP verification -> relation model  (relations.jsonl)
+    generate --arm A   BLIP caption for one prefix arm              (captions_A.jsonl)
+    candidates         multi-candidate BLIP + uniform scoring       (candidates.jsonl)
+    tune-rerank        pick the rerank weights on VALIDATION, then LOCK them
+    rerank --arm A     choose one candidate per image with the locked weights
     smoke              all of the above on ~5 images, with PASS/FAIL checks
     examples           side-by-side qualitative examples (not evidence)
     report             print the scored results
@@ -40,6 +56,7 @@ PROJ_ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(PROJ_ROOT))
 
 from build_caption_eval_set import FROZEN_SPLIT_IDS_SHA256, split_ids_sha256  # noqa: E402
+from utils.caption_rerank import SOURCE_ORDER  # noqa: E402
 from utils.caption_relations import (  # noqa: E402
     DEFAULT_CHECKPOINT_ROOT,
     RELATION_CONFIDENCE_THRESHOLD,
@@ -50,9 +67,16 @@ DEFAULT_RESULTS_ROOT = "results_caption"
 DEFAULT_SELECTION = f"{DEFAULT_RESULTS_ROOT}/relation_checkpoint_selection.json"
 DEFAULT_RUN_DIR = f"{DEFAULT_RESULTS_ROOT}/main"
 DEFAULT_SPLIT_MANIFEST = "splits/e0_image_split.json"
+DEFAULT_WEIGHTS = f"{DEFAULT_RESULTS_ROOT}/rerank_weights.json"
+DEFAULT_NUM_CANDIDATES = 4        # == EXPERIMENT_GENERATION_CONFIG["num_beams"]
+DEFAULT_SCORE_BATCH_SIZE = 12
+DEFAULT_VAL_EVAL_SET = "splits/caption_eval_val_200.json"
+DEFAULT_VAL_RUN_DIR = f"{DEFAULT_RESULTS_ROOT}/val_tuning"
 YOLO_CONF = 0.5            # grounded_caption_pipeline.py's detection threshold
 YOLO_TOP_K = 10
-ARMS = ("baseline", "grounded", "objects_only")
+PREFIX_ARMS = ("baseline", "grounded", "objects_only")
+RERANK_ARMS = ("object_reranked", "relation_reranked")
+ARMS = PREFIX_ARMS
 SYNTHETIC_RELATION = {"subject": "person", "predicate": "riding", "object": "bicycle",
                       "confidence": 1.0}
 
@@ -128,15 +152,17 @@ def _done_ids(path: Path) -> set:
     return {str(r["image_id"]) for r in read_jsonl(path)}
 
 
-def load_eval_set(path: str, allow_small: bool) -> Dict:
+def load_eval_set(path: str, allow_small: bool, allow_val: bool = False) -> Dict:
     if not Path(path).is_file():
         raise SystemExit(f"evaluation set {path} not found - run build_caption_eval_set.py")
     es = json.loads(Path(path).read_text(encoding="utf-8"))
     meta = es["meta"]
     if meta.get("split_ids_sha256") != FROZEN_SPLIT_IDS_SHA256:
         raise SystemExit(f"{path} was not built from the frozen E0 split")
-    if meta.get("split") != "test" and not allow_small:
+    if meta.get("split") != "test" and not (allow_small or allow_val):
         raise SystemExit(f"{path} draws from split {meta.get('split')!r}, not test")
+    if meta.get("split") == "val" and not (allow_small or allow_val):
+        raise SystemExit(f"{path} is a VALIDATION set; pass --tuning to use it")
     if meta.get("status") != "OK" and not allow_small:
         raise SystemExit(f"{path} has status {meta.get('status')} "
                          f"({meta.get('final')} usable images) - STOP")
@@ -234,6 +260,27 @@ def cmd_preflight(args) -> int:
     else:
         line("relation checkpoint selection", False,
              f"{args.selection} missing - run select-checkpoint")
+
+    if Path(args.val_eval_set).is_file():
+        vm = json.loads(Path(args.val_eval_set).read_text(encoding="utf-8"))["meta"]
+        line("validation caption set (tuning)", vm.get("split") == "val",
+             f"split {vm.get('split')}, {vm.get('final')} images, status {vm.get('status')}",
+             optional=True)
+    else:
+        line("validation caption set (tuning)", False,
+             f"{args.val_eval_set} missing - build_caption_eval_set.py --split val "
+             "(only needed for the reranking arms)", optional=True)
+
+    if Path(args.weights).is_file():
+        w = json.loads(Path(args.weights).read_text(encoding="utf-8"))
+        sel = w.get("selected_on") or {}
+        line("locked rerank weights", sel.get("split") == "val",
+             f"{w.get('weights')} selected on {sel.get('n_images')} {sel.get('split')} images",
+             optional=True)
+    else:
+        line("locked rerank weights", False,
+             f"{args.weights} missing - run tune-rerank on the validation run "
+             "(only needed for the reranking arms)", optional=True)
 
     free = shutil.disk_usage(PROJ_ROOT).free / 2 ** 30
     line("free disk", free > 2, f"{free:.1f} GiB")
@@ -422,7 +469,7 @@ def run_detect(run_dir: Path, es: Dict, eval_set_path: str, selection: Dict, ids
 
 
 def cmd_detect(args) -> int:
-    es = load_eval_set(args.eval_set, args.allow_small)
+    es = load_eval_set(args.eval_set, args.allow_small, allow_val=getattr(args, "tuning", False))
     selection = load_selection(args.selection)
     ids = _image_ids(es, args.limit)
     run_detect(Path(args.run_dir), es, args.eval_set, selection, ids, args.relation_threshold,
@@ -521,6 +568,348 @@ def run_generate(run_dir: Path, arm: str, blip_dtype: str, seed: int = 42) -> Li
 
 def cmd_generate(args) -> int:
     run_generate(Path(args.run_dir), args.arm, args.blip_dtype, args.seed)
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# candidates: multi-candidate BLIP generation (the reranking arms' generator)
+# ---------------------------------------------------------------------------
+
+def run_candidates(run_dir: Path, num_candidates: int, batch_size: int, blip_dtype: str,
+                   seed: int = 42) -> List[Dict]:
+    """Generate and uniformly score the candidate pool for every image.
+
+    One pass over the images produces the pool BOTH reranking arms choose
+    from, so the two arms differ in nothing but their scoring weights. The
+    stage is resumable and refuses to mix generation settings inside one run
+    directory, exactly like `generate`.
+    """
+    from PIL import Image
+    from utils.blip_captioner import EXPERIMENT_GENERATION_CONFIG, blip_model_info
+    from utils.caption_candidates import generate_and_score
+    from utils.caption_experiment_eval import keyed, read_jsonl
+
+    cfg = load_run_config(run_dir)
+    ids = [str(i) for i in cfg["image_ids"]]
+    rel_path = run_dir / "relations.jsonl"
+    if not rel_path.is_file():
+        raise SystemExit(f"{rel_path} missing - run detect first")
+    relations = keyed(read_jsonl(rel_path), "relations.jsonl")
+    missing = [i for i in ids if i not in relations]
+    if missing:
+        raise SystemExit(f"relations.jsonl is incomplete ({len(missing)} images missing); "
+                         "finish detect first")
+    es = json.loads(Path(cfg["eval_set"]["path"]).read_text(encoding="utf-8"))
+    if es["meta"]["usable_ids_sha256"] != cfg["eval_set"]["usable_ids_sha256"]:
+        raise SystemExit("evaluation set changed since detect ran; refusing to generate")
+    files = {i: es["images"][i]["file"] for i in ids}
+
+    out_path = run_dir / "candidates.jsonl"
+    meta_path = run_dir / "candidates.meta.json"
+    meta = {"num_candidates": num_candidates, "blip_dtype": blip_dtype,
+            "generation_config": EXPERIMENT_GENERATION_CONFIG,
+            "score_batch_size": batch_size, "seed": seed,
+            "candidate_sources": list(SOURCE_ORDER),
+            "policy": ("beams of the baseline prefix always; of the objects-only and "
+                       "relation prefixes whenever a relation was selected, at ANY "
+                       "confidence - the confidence is scored, not gated"),
+            "lm_score": ("mean per-token log P(caption | image), teacher-forced with "
+                         "identical conditioning for every candidate")}
+    if meta_path.is_file():
+        old = json.loads(meta_path.read_text(encoding="utf-8"))
+        differing = [k for k in ("num_candidates", "blip_dtype", "generation_config", "seed")
+                     if old.get(k) != meta[k]]
+        if differing:
+            raise SystemExit(f"{meta_path} records different settings {differing}; "
+                             "refusing to mix them in one run directory")
+
+    done = _done_ids(out_path)
+    todo = [i for i in ids if i not in done]
+    print(f"[candidates] {len(ids)} images, {len(done)} done, {len(todo)} to generate "
+          f"(K={num_candidates} per prefix)")
+    if not todo:
+        return []
+
+    _set_seed(seed)
+    dtype = _blip_dtype(blip_dtype)
+    written = []
+    with open(out_path, "a", encoding="utf-8") as fh:
+        for n, iid in enumerate(todo, 1):
+            t0 = time.time()
+            image = Image.open(files[iid]).convert("RGB")
+            selected = relations[iid].get("selected_relation")
+            result = generate_and_score(image, selected, num_candidates=num_candidates,
+                                        batch_size=batch_size, dtype=dtype)
+            rec = {"image_id": iid, "prefixes": result["prefixes"],
+                   "relation": ({k: selected[k] for k in
+                                 ("subject", "predicate", "object", "confidence")}
+                                if selected else None),
+                   "candidates": result["candidates"],
+                   "seconds": round(time.time() - t0, 3)}
+            _append_jsonl(fh, rec)
+            written.append(rec)
+            print(f"[candidates] {n}/{len(todo)} {iid}: {len(rec['candidates'])} candidates "
+                  f"from {len(rec['prefixes'])} prefixes in {rec['seconds']:.1f}s")
+    meta["blip"] = blip_model_info()
+    _write_json(meta_path, meta)
+    return written
+
+
+def cmd_candidates(args) -> int:
+    run_candidates(Path(args.run_dir), args.num_candidates, args.batch_size,
+                   args.blip_dtype, args.seed)
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# rerank: choose one candidate per image (pure CPU, no model, no ground truth)
+# ---------------------------------------------------------------------------
+
+def load_weights(path: str) -> Dict:
+    p = Path(path)
+    if not p.is_file():
+        raise SystemExit(f"{p} not found - run `tune-rerank` on the VALIDATION run first. "
+                         "Weights must never be chosen on the frozen test set.")
+    return json.loads(p.read_text(encoding="utf-8"))
+
+
+def run_rerank(run_dir: Path, arm: str, weights_file: Dict, weights_path: str) -> List[Dict]:
+    """Select one caption per image from the cached pool.
+
+    This stage opens run_config.json, relations.jsonl and candidates.jsonl and
+    nothing else. In particular it never opens the evaluation manifest, which
+    is the only file in the run that carries human annotations.
+    """
+    from utils.caption_experiment_eval import keyed, read_jsonl
+    from utils.caption_rerank import (RerankWeights, evidence_objects, first_candidate,
+                                      rerank)
+
+    if arm not in RERANK_ARMS:
+        raise SystemExit(f"{arm} is not a reranking arm ({RERANK_ARMS})")
+    cfg = load_run_config(run_dir)
+    ids = [str(i) for i in cfg["image_ids"]]
+    relations = keyed(read_jsonl(run_dir / "relations.jsonl"), "relations.jsonl")
+    cand_path = run_dir / "candidates.jsonl"
+    if not cand_path.is_file():
+        raise SystemExit(f"{cand_path} missing - run the candidates stage first")
+    pools = keyed(read_jsonl(cand_path), "candidates.jsonl")
+    missing = [i for i in ids if i not in pools]
+    if missing:
+        raise SystemExit(f"candidates.jsonl is incomplete ({len(missing)} images missing)")
+
+    full = RerankWeights.from_dict(weights_file["weights"][arm])
+    if arm == "object_reranked" and full.w_rel:
+        raise SystemExit("object_reranked must have w_rel = 0 in the weights file")
+    weights = full.without_relation() if arm == "object_reranked" else full
+    contrast = full.without_relation() if arm == "relation_reranked" else None
+
+    meta_path = run_dir / f"captions_{arm}.meta.json"
+    meta = {"arm": arm, "weights": weights.as_dict(), "weights_sha256": weights.sha256(),
+            "weights_file": weights_path.replace("\\", "/"),
+            "weights_file_sha256": _sha256(weights_path),
+            "weights_selected_on": weights_file.get("selected_on"),
+            "objective": weights_file.get("objective")}
+    if meta_path.is_file():
+        old = json.loads(meta_path.read_text(encoding="utf-8"))
+        if old.get("weights_sha256") != meta["weights_sha256"]:
+            raise SystemExit(f"{meta_path} records DIFFERENT weights ({old.get('weights')}); "
+                             "use a new --run-dir rather than re-selecting on this one")
+
+    out_path = run_dir / f"captions_{arm}.jsonl"
+    written = []
+    with open(out_path, "w", encoding="utf-8") as fh:
+        for iid in ids:
+            pool = pools[iid]["candidates"]
+            selected = relations[iid].get("selected_relation")
+            evidence = evidence_objects(relations[iid].get("verified_detections", []))
+            choice = rerank(pool, evidence, selected, weights)
+            first = first_candidate(pool)
+            alt = (rerank(pool, evidence, selected, contrast)["caption"]
+                   if contrast is not None else None)
+            prefix = pools[iid]["prefixes"][choice["source"]]
+            rec = {
+                "image_id": iid, "arm": arm,
+                "caption": choice["caption"],
+                "prefix": prefix,
+                "source": choice["source"], "beam_rank": choice["beam_rank"],
+                "score": choice["score"], "terms": choice["terms"],
+                "relation": pools[iid].get("relation"),
+                "relation_used": bool(choice["relation_stated"]),
+                "evidence_objects": sorted(evidence),
+                "n_supported": choice["n_supported"],
+                "n_unsupported": choice["n_unsupported"],
+                "n_candidates": len(pool),
+                "n_candidates_scored": choice["n_candidates_scored"],
+                "n_candidates_dropped": choice["n_candidates_dropped"],
+                "dropped": choice["dropped"],
+                "first_candidate": None if first is None else first["text"],
+                "changed_from_first_candidate":
+                    first is not None and choice["caption"] != first["text"],
+                "changed_by_relation_term": alt is not None and alt != choice["caption"],
+                "prefix_echoed": choice["caption"].lower().startswith(prefix.lower()),
+                "scores": [{k: r[k] for k in ("text", "source", "beam_rank", "score")}
+                           for r in choice["ranking"]],
+            }
+            _append_jsonl(fh, rec)
+            written.append(rec)
+    _write_json(meta_path, meta)
+    changed = sum(r["changed_from_first_candidate"] for r in written)
+    stated = sum(r["relation_used"] for r in written)
+    print(f"[rerank:{arm}] {len(written)} images, weights {weights.as_dict()}; "
+          f"{changed} captions differ from BLIP's first candidate; "
+          f"{stated} state the predicted relation -> {out_path}")
+    return written
+
+
+def cmd_rerank(args) -> int:
+    weights_file = load_weights(args.weights)
+    for arm in (RERANK_ARMS if args.arm == "all" else (args.arm,)):
+        run_rerank(Path(args.run_dir), arm, weights_file, args.weights)
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# tune-rerank: choose the weights on the VALIDATION split, then lock them
+# ---------------------------------------------------------------------------
+
+# Pre-declared grid and objective (fixed before any weight was scored).
+W_OBJ_GRID = (0.0, 0.1, 0.25, 0.5, 1.0)
+W_HALL_GRID = (0.0, 0.25, 0.5, 1.0, 2.0)
+W_REL_GRID = (0.0, 0.25, 0.5, 1.0, 2.0)
+TUNING_OBJECTIVE = (
+    "maximise POPE-adversarial F1 on the validation images; ties -> lower CHAIR_i; "
+    "ties -> smaller L1 norm of the weights (prefer the simpler scorer); "
+    "ties -> lexicographically smallest (w_obj, w_hall, w_rel). POPE F1 is used "
+    "because it is symmetric: asserting an absent object costs a false positive "
+    "and staying silent about a present one costs a false negative, so a caption "
+    "cannot win by saying less - which CHAIR_i alone would reward."
+)
+
+
+def _tuning_candidate_pools(run_dir: Path, ids: List[str]):
+    from utils.caption_experiment_eval import keyed, read_jsonl
+    from utils.caption_rerank import evidence_objects
+
+    relations = keyed(read_jsonl(run_dir / "relations.jsonl"), "relations.jsonl")
+    pools = keyed(read_jsonl(run_dir / "candidates.jsonl"), "candidates.jsonl")
+    missing = [i for i in ids if i not in pools or i not in relations]
+    if missing:
+        raise SystemExit(f"validation run is incomplete ({len(missing)} images missing)")
+    return [
+        {"image_id": i,
+         "candidates": pools[i]["candidates"],
+         "relation": relations[i].get("selected_relation"),
+         "evidence": evidence_objects(relations[i].get("verified_detections", []))}
+        for i in ids
+    ]
+
+
+def _score_weights(items, gt, probes, weights):
+    """Validation metrics for one weight vector. Ground truth is used HERE only -
+    to score a candidate selection that was made without it."""
+    from utils.caption_hallucination import aggregate_chair, caption_object_record, score_pope
+    from utils.caption_rerank import rerank
+
+    captions = {it["image_id"]: rerank(it["candidates"], it["evidence"], it["relation"],
+                                       weights)["caption"] for it in items}
+    records = [caption_object_record(captions[i], gt[i]) for i in captions]
+    mentioned = {i: set(r["mentioned"]) for i, r in zip(captions, records)}
+    chair = aggregate_chair(records)
+    pope = score_pope(probes["adversarial"], mentioned)
+    return {"weights": weights.as_dict(), "pope_adversarial_f1": pope["f1"],
+            "chair_i": chair["chair_i"], "chair_s": chair["chair_s"],
+            "object_recall": chair["object_recall"],
+            "mean_mentioned_objects": chair["mean_mentioned_objects"],
+            "mean_hallucinated_objects": chair["mean_hallucinated_objects"],
+            "pope_adversarial_accuracy": pope["accuracy"],
+            "l1": sum(abs(v) for v in weights.as_dict().values())}
+
+
+def _best(rows):
+    return sorted(rows, key=lambda r: (-round(r["pope_adversarial_f1"], 9),
+                                       round(r["chair_i"], 9), round(r["l1"], 9),
+                                       r["weights"]["w_obj"], r["weights"]["w_hall"],
+                                       r["weights"]["w_rel"]))[0]
+
+
+def cmd_tune_rerank(args) -> int:
+    from utils.caption_hallucination import build_pope_probes
+    from utils.caption_rerank import RerankWeights
+
+    run_dir = Path(args.run_dir)
+    cfg = load_run_config(run_dir)
+    if cfg["eval_set"].get("split") == "test":
+        raise SystemExit("refusing to tune on a TEST run directory. Weights are selected "
+                         "on the validation split only (see CAPTION_RERANKING.md).")
+    es = json.loads(Path(cfg["eval_set"]["path"]).read_text(encoding="utf-8"))
+    ids = [str(i) for i in cfg["image_ids"]]
+    gt = {i: set(es["images"][i]["objects"]) for i in ids}
+    probes = build_pope_probes(gt, seed=args.seed)
+    items = _tuning_candidate_pools(run_dir, ids)
+
+    print("=" * 78)
+    print(f"RERANK WEIGHT SELECTION on {len(ids)} VALIDATION images ({cfg['eval_set']['path']})")
+    print("=" * 78)
+    print(f"  objective: {TUNING_OBJECTIVE}")
+
+    object_grid = [_score_weights(items, gt, probes, RerankWeights(o, h, 0.0))
+                   for o in W_OBJ_GRID for h in W_HALL_GRID]
+    object_best = _best(object_grid)
+    ow = RerankWeights.from_dict(object_best["weights"])
+    print(f"\n  object_reranked  -> w_obj={ow.w_obj} w_hall={ow.w_hall} "
+          f"(POPE-adv F1 {object_best['pope_adversarial_f1']:.4f}, "
+          f"CHAIR_i {object_best['chair_i']:.4f})")
+
+    # The relation arm inherits the object weights and tunes ONE parameter, so
+    # the two arms differ by exactly the relation term.
+    relation_grid = [_score_weights(items, gt, probes, RerankWeights(ow.w_obj, ow.w_hall, r))
+                     for r in W_REL_GRID]
+    relation_best = _best(relation_grid)
+    rw = RerankWeights.from_dict(relation_best["weights"])
+    print(f"  relation_reranked-> w_rel={rw.w_rel} "
+          f"(POPE-adv F1 {relation_best['pope_adversarial_f1']:.4f}, "
+          f"CHAIR_i {relation_best['chair_i']:.4f})")
+
+    out = {
+        "created_utc": _now(),
+        "git": _git(),
+        "selected_on": {
+            "run_dir": str(run_dir).replace("\\", "/"),
+            "eval_set": cfg["eval_set"],
+            "n_images": len(ids),
+            "split": cfg["eval_set"].get("split"),
+            "seed": args.seed,
+        },
+        "objective": TUNING_OBJECTIVE,
+        "procedure": (
+            "1. w_rel = 0: grid over (w_obj, w_hall) -> object_reranked weights. "
+            "2. w_obj, w_hall fixed at that optimum: grid over w_rel -> "
+            "relation_reranked weights. The two arms therefore differ by one "
+            "parameter and one scoring term, nothing else."),
+        "grid": {"w_obj": list(W_OBJ_GRID), "w_hall": list(W_HALL_GRID),
+                 "w_rel": list(W_REL_GRID)},
+        "weights": {"object_reranked": ow.as_dict(), "relation_reranked": rw.as_dict()},
+        "weights_sha256": {"object_reranked": ow.sha256(), "relation_reranked": rw.sha256()},
+        "validation_metrics": {"object_reranked": object_best,
+                               "relation_reranked": relation_best},
+        "object_grid": object_grid,
+        "relation_grid": relation_grid,
+        "candidates_meta": json.loads((run_dir / "candidates.meta.json").read_text("utf-8"))
+        if (run_dir / "candidates.meta.json").is_file() else None,
+    }
+    path = Path(args.output)
+    if path.is_file() and not args.force:
+        old = json.loads(path.read_text(encoding="utf-8"))
+        if old.get("weights") != out["weights"]:
+            raise SystemExit(f"{path} already LOCKS different weights {old.get('weights')}. "
+                             "Re-tuning after the frozen test run would be post-hoc "
+                             "optimisation; pass --force only if the test run has not "
+                             "happened yet.")
+        print(f"\n  {path} already locks these weights; left unchanged.")
+        return 0
+    _write_json(path, out)
+    print(f"\n  LOCKED -> {path}")
+    print("  Do not re-run this after the frozen test evaluation.")
     return 0
 
 
@@ -644,6 +1033,10 @@ def cmd_smoke(args) -> int:
     check("fallback reproduces baseline caption", "WARN" if fb_diff else "PASS",
           f"{len(fb) - len(fb_diff)}/{len(fb)} fallback captions identical to baseline")
 
+    # --- reranking arms -----------------------------------------------------
+    if not args.no_rerank:
+        _smoke_rerank(run_dir, ids, rel, caps, dtype, args, check)
+
     try:
         res = evaluate_run(run_dir, args.eval_set, allow_small=True, n_bootstrap=200,
                            seed=args.seed, clipscore=not args.no_clipscore, clip_device=None)
@@ -653,6 +1046,119 @@ def cmd_smoke(args) -> int:
     except Exception as exc:
         check("hallucination evaluation accepts all arms", "FAIL", repr(exc))
     return _finish_smoke(run_dir, checks)
+
+
+# Probe weights for the smoke test only. They exercise every term of the score
+# and are NOT the experiment's weights: those are locked by `tune-rerank` on the
+# validation split. Nothing measured during a smoke run is a result.
+SMOKE_PROBE_WEIGHTS = {"w_obj": 0.5, "w_hall": 0.5, "w_rel": 1.0}
+
+
+def _smoke_rerank(run_dir, ids, rel, caps, dtype, args, check) -> None:
+    """Prove the reranking path works on the real model: the pool contains each
+    prefix arm's own caption, the uniform scorer agrees with its fallback, and
+    selection is deterministic."""
+    import torch
+    from utils.caption_candidates import (candidate_prefixes, generate_candidates,
+                                          score_candidates)
+    from utils.caption_experiment_eval import keyed, read_jsonl
+    from utils.caption_rerank import RerankWeights
+
+    try:
+        run_candidates(run_dir, args.num_candidates, args.batch_size, args.blip_dtype,
+                       args.seed)
+        pools = keyed(read_jsonl(run_dir / "candidates.jsonl"), "candidates")
+        sizes = {i: len(pools[i]["candidates"]) for i in ids}
+        check("candidate pools generated",
+              "PASS" if all(sizes.values()) else "FAIL",
+              f"candidates per image {sizes} (K={args.num_candidates} per prefix)")
+    except Exception as exc:
+        check("candidate pools generated", "FAIL", repr(exc))
+        return
+
+    # The pool must literally contain what each single-caption arm produced.
+    mismatches = []
+    for iid in ids:
+        pool = pools[iid]["candidates"]
+        for arm, source in (("baseline", "baseline"), ("grounded", "relation"),
+                            ("objects_only", "objects_only")):
+            rec = caps[arm][iid]
+            if arm != "baseline" and not rec.get("relation_used"):
+                continue
+            rank0 = [c for c in pool if c["source"] == source and c["beam_rank"] == 0]
+            if not rank0:
+                mismatches.append(f"{iid}: no {source} candidate for the {arm} arm")
+            elif rank0[0]["text"] != rec["caption"]:
+                mismatches.append(f"{iid}/{arm}: pool has {rank0[0]['text']!r}, "
+                                  f"arm has {rec['caption']!r}")
+    check("pool contains every prefix arm's own caption",
+          "FAIL" if mismatches else "PASS",
+          "; ".join(mismatches) if mismatches else
+          "beam 0 of each prefix is byte-identical to that arm's single caption")
+
+    # The shared-image-embedding scorer must agree with the public forward.
+    try:
+        from PIL import Image
+        import utils.caption_candidates as cc
+        image = Image.open(rel[ids[0]]["file"]).convert("RGB")
+        cands = generate_candidates(image, candidate_prefixes(rel[ids[0]]["selected_relation"]),
+                                    num_candidates=args.num_candidates, dtype=dtype)
+        fast = {c["text"]: c["lm_score"]
+                for c in score_candidates(image, cands, batch_size=args.batch_size, dtype=dtype)}
+        original = cc._decode_logits
+
+        def forward_only(model, input_ids, attention_mask, image_embeds, pixel_values, batch):
+            return model(pixel_values=pixel_values.expand(batch, -1, -1, -1),
+                         input_ids=input_ids, attention_mask=attention_mask).logits
+
+        cc._decode_logits = forward_only
+        try:
+            slow = {c["text"]: c["lm_score"]
+                    for c in score_candidates(image, cands, batch_size=args.batch_size,
+                                              dtype=dtype)}
+        finally:
+            cc._decode_logits = original
+        worst = max(abs(fast[t] - slow[t]) for t in fast)
+        check("candidate scoring matches the reference forward",
+              "PASS" if worst < 1e-3 else "FAIL",
+              f"max |shared-embedding - public forward| = {worst:.2e} over {len(fast)} candidates")
+    except Exception as exc:
+        check("candidate scoring matches the reference forward", "FAIL", repr(exc))
+
+    weights_path = run_dir / "smoke_probe_weights.json"
+    _write_json(weights_path, {
+        "objective": "SMOKE PROBE ONLY - not selected on any data",
+        "selected_on": {"split": "none", "n_images": 0},
+        "weights": {"object_reranked": {**SMOKE_PROBE_WEIGHTS, "w_rel": 0.0},
+                    "relation_reranked": dict(SMOKE_PROBE_WEIGHTS)},
+    })
+    weights_file = load_weights(str(weights_path))
+    try:
+        rows = {arm: run_rerank(run_dir, arm, weights_file, str(weights_path))
+                for arm in RERANK_ARMS}
+        pool_texts = {i: {c["text"] for c in pools[i]["candidates"]} for i in ids}
+        bad = [f"{arm}/{r['image_id']}" for arm, rs in rows.items() for r in rs
+               if r["caption"] not in pool_texts[r["image_id"]]]
+        check("reranked captions come from the pool", "FAIL" if bad else "PASS",
+              "; ".join(bad) if bad else
+              f"{sum(len(r) for r in rows.values())} selections, all from the generated pool")
+        changed = sum(r["changed_from_first_candidate"] for r in rows["relation_reranked"])
+        check("reranker can depart from BLIP's first candidate", "PASS",
+              f"{changed}/{len(ids)} changed with the probe weights {SMOKE_PROBE_WEIGHTS} "
+              "(plumbing only, not a result)")
+    except Exception as exc:
+        check("reranked captions come from the pool", "FAIL", repr(exc))
+        return
+
+    for arm in RERANK_ARMS:
+        (run_dir / f"captions_{arm}.meta.json").unlink(missing_ok=True)
+    again = {arm: run_rerank(run_dir, arm, weights_file, str(weights_path))
+             for arm in RERANK_ARMS}
+    same = all(json.dumps(rows[a], sort_keys=True) == json.dumps(again[a], sort_keys=True)
+               for a in RERANK_ARMS)
+    check("reranking is deterministic", "PASS" if same else "FAIL",
+          "re-running the selection reproduces every caption and score" if same
+          else "a second selection differed")
 
 
 def _finish_smoke(run_dir: Path, checks: List[Dict]) -> int:
@@ -832,6 +1338,8 @@ def main(argv=None) -> int:
     common(p)
     p.add_argument("--vg-root", default="data/visual_genome")
     p.add_argument("--split-manifest", default=DEFAULT_SPLIT_MANIFEST)
+    p.add_argument("--val-eval-set", default=DEFAULT_VAL_EVAL_SET)
+    p.add_argument("--weights", default=DEFAULT_WEIGHTS)
     p.set_defaults(fn=cmd_preflight)
 
     p = sub.add_parser("select-checkpoint", help="choose the relation checkpoint by validation top-1")
@@ -852,6 +1360,9 @@ def main(argv=None) -> int:
     common(p)
     relation_args(p)
     p.add_argument("--limit", type=int, default=None)
+    p.add_argument("--tuning", action="store_true",
+                   help="allow a VALIDATION-split evaluation set (weight tuning only; "
+                        "the frozen test set is never tuned on)")
     p.set_defaults(fn=cmd_detect)
 
     p = sub.add_parser("generate", help="BLIP captions for one arm")
@@ -861,12 +1372,43 @@ def main(argv=None) -> int:
                    help="float32 default: GTX 16xx cards are prone to fp16 NaNs")
     p.set_defaults(fn=cmd_generate)
 
+    def rerank_gen_args(p):
+        p.add_argument("--num-candidates", type=int, default=DEFAULT_NUM_CANDIDATES,
+                       help=f"beams returned per prefix (default {DEFAULT_NUM_CANDIDATES} = "
+                            "num_beams, so beam 0 of each prefix is exactly what the "
+                            "corresponding single-caption arm produces)")
+        p.add_argument("--batch-size", type=int, default=DEFAULT_SCORE_BATCH_SIZE,
+                       help="candidates scored per forward pass (VRAM knob)")
+        p.add_argument("--blip-dtype", choices=("float32", "float16"), default="float32",
+                       help="float32 default: GTX 16xx cards are prone to fp16 NaNs")
+
+    p = sub.add_parser("candidates", help="multi-candidate BLIP generation for the "
+                                          "reranking arms")
+    common(p)
+    rerank_gen_args(p)
+    p.set_defaults(fn=cmd_candidates)
+
+    p = sub.add_parser("rerank", help="select one candidate per image with LOCKED weights")
+    common(p)
+    p.add_argument("--arm", choices=RERANK_ARMS + ("all",), default="all")
+    p.add_argument("--weights", default=DEFAULT_WEIGHTS,
+                   help="weights locked by tune-rerank on the validation split")
+    p.set_defaults(fn=cmd_rerank)
+
+    p = sub.add_parser("tune-rerank", help="select the rerank weights on VALIDATION images")
+    common(p, run_dir=DEFAULT_VAL_RUN_DIR)
+    p.add_argument("--output", default=DEFAULT_WEIGHTS)
+    p.add_argument("--force", action="store_true")
+    p.set_defaults(fn=cmd_tune_rerank)
+
     p = sub.add_parser("smoke", help="end-to-end check on a few images")
     common(p, run_dir=f"{DEFAULT_RESULTS_ROOT}/smoke")
     relation_args(p)
     p.add_argument("--n", type=int, default=5)
-    p.add_argument("--blip-dtype", choices=("float32", "float16"), default="float32")
     p.add_argument("--no-clipscore", action="store_true")
+    p.add_argument("--no-rerank", action="store_true",
+                   help="skip the candidate-generation and reranking checks")
+    rerank_gen_args(p)
     p.add_argument("--force", action="store_true", help="wipe an existing smoke run dir")
     p.set_defaults(fn=cmd_smoke)
 
