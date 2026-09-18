@@ -16,7 +16,7 @@ Pillow
 transformers          # CLIP vision encoder (openai/clip-vit-base-patch32)
 requests              # prepare_visual_genome.py / download_vg.py
 tqdm
-pytest                # tests/ - the 151-test regression suite
+pytest                # tests/ - the regression suite (no GPU, no dataset)
 
 # ---------------------------------------------------------------------------
 # Optional: only needed for arms you may not be running.

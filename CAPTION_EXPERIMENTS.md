@@ -80,9 +80,11 @@ missing: `pip install -r requirements.txt`.
 python -m pytest tests/ -q
 ```
 
-Expected: **327 passed, 1 skipped** (the skip is the legacy `test_pope.py`, which
-needs `nltk`; if `nltk` is installed it runs and you get 328 passed). No test
-needs a GPU, the VG images or the trained checkpoints.
+Expected: **407 passed, 2 skipped**. The skips are the legacy `test_pope.py`
+(needs `nltk`) and the caption-set disjointness check (needs both evaluation
+sets built - it runs, and the count becomes 408, once the validation set of
+`CAPTION_RERANKING.md` exists). No test needs a GPU, the VG images or the
+trained checkpoints.
 
 ## 4. Verify the trained relation checkpoint
 
